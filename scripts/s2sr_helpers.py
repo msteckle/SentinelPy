@@ -17,6 +17,7 @@ import shutil
 import stat
 import subprocess
 import logging
+import sysconfig
 from pathlib import Path
 from typing import Iterable, Sequence
 from glob import glob
@@ -91,6 +92,7 @@ def gdalinfo_json(p: Path) -> dict:
     out = subprocess.run(["gdalinfo", "-json", str(p)],
                          check=True, capture_output=True, text=True)
     return json.loads(out.stdout)
+
 
 # ---------------------------------------------------------------------
 # AOI & GRID
@@ -221,10 +223,10 @@ def get_access_token(credentials: dict, token_cache: dict, *, force_refresh: boo
         try:
             j = _refresh_grant(rtok)
             token_cache["access_token"] = j["access_token"]
-            token_cache["expires_at"]   = now + int(j.get("expires_in", 3600))
+            token_cache["expires_at"] = now + int(j.get("expires_in", 3600))
             if "refresh_token" in j:
-                token_cache["refresh_token"]       = j["refresh_token"]
-                token_cache["refresh_expires_at"]  = now + int(j.get("refresh_expires_in", 0) or 0)
+                token_cache["refresh_token"] = j["refresh_token"]
+                token_cache["refresh_expires_at"] = now + int(j.get("refresh_expires_in", 0) or 0)
             return token_cache["access_token"]
         except Exception:
             pass  # fall back to password grant
@@ -308,7 +310,7 @@ def extract_tile_from_name(product_name: str) -> str | None:
     return None
 
 def select_targets(session: requests.Session, product_id, product_name: str,
-                   bands_20m: Iterable[str]) -> tuple[list[tuple], str, str | None]:
+                   bands: Iterable[str], bands_res: str) -> tuple[list[tuple], str, str | None]:
     """
     Build the list of file-node paths (as tuples of node segments) to download.
     """
@@ -328,12 +330,12 @@ def select_targets(session: requests.Session, product_id, product_name: str,
     targets: list[tuple] = []
     if granule_dir:
         try:
-            r20m = list_children(session, product_id, root, "GRANULE", granule_dir, "IMG_DATA", "R20m")
-            for node in r20m:
+            res = list_children(session, product_id, root, "GRANULE", granule_dir, "IMG_DATA", f"R{bands_res}m")
+            for node in res:
                 fname = node.get("Name", "")
-                for b in bands_20m:
-                    if fname.endswith(f"_{b}_20m.jp2"):
-                        targets.append((root, "GRANULE", granule_dir, "IMG_DATA", "R20m", fname))
+                for b in bands:
+                    if fname.endswith(f"_{b}_{bands_res}m.jp2"):
+                        targets.append((root, "GRANULE", granule_dir, "IMG_DATA", f"R{bands_res}m", fname))
                         break
         except requests.HTTPError:
             pass
@@ -430,7 +432,7 @@ def _res_from(el):
     m = re.search(r'(\d+)\s*m?$', _local(el))
     return float(m.group(1)) if m else None
 
-def parse_tile_xml(xml_path: str, resolution: str = "20") -> dict:
+def parse_tile_xml(xml_path: str, resolution: str) -> dict:
     target = int(float(resolution))
     root = ET.parse(xml_path).getroot()
 
@@ -538,11 +540,11 @@ def append_scene_rows_bulk(csv_path: Path, rows: list[dict]) -> int:
             wrote += 1
     return wrote
 
-def backfill_index_from_existing_xmls(output_root: str | Path, csv_path: Path) -> int:
+def backfill_index_from_existing_xmls(output_root: str | Path, bands_res: str, csv_path: Path) -> int:
     rows = []
     for xml in Path(output_root).glob("**/GRANULE/*/MTD_T*.xml"):
         try:
-            geo = parse_tile_xml(str(xml), resolution="20")
+            geo = parse_tile_xml(str(xml), resolution=bands_res)
         except Exception as e:
             print("BACKFILL parse error:", xml, e); continue
         safe = next((p for p in xml.parents if p.name.endswith(".SAFE")), None)
@@ -562,8 +564,6 @@ def backfill_index_from_existing_xmls(output_root: str | Path, csv_path: Path) -
 # DOWNLOAD ONE PRODUCT
 # ---------------------------------------------------------------------
 
-ALLOWED_20M = {"B02","B03","B04","B05","B06","B07","B8A","B11","B12"}
-
 def _guess_local_granule_dir(safe_dir: Path, product_name: str) -> Path | None:
     """Pick the most likely GRANULE dir on disk without hitting the API."""
     tile = extract_tile_from_name(product_name)
@@ -579,13 +579,15 @@ def _guess_local_granule_dir(safe_dir: Path, product_name: str) -> Path | None:
             return c
     return candidates[0]
 
+
 def fast_local_complete_safe(output_root: Path, product_name: str,
-                             bands_20m: Iterable[str] | None = None,
+                             bands_res: str,
+                             bands: Iterable[str] | None = None,
                              require_xml: bool = True) -> tuple[bool, dict]:
     """
     Returns (is_complete, detail_dict). Does **no network I/O**.
-    Complete means: for the chosen GRANULE, all requested 20m bands (plus SCL)
-    exist under IMG_DATA/R20m, and (optionally) MTD_TL.xml + MTD_MSIL2A.xml exist.
+    Complete means: for the chosen GRANULE, all requested bands (plus SCL)
+    exist under IMG_DATA/R{bands_res}m, and (optionally) MTD_TL.xml + MTD_MSIL2A.xml exist.
     """
     safe_dir = output_root / (product_name if product_name.endswith(".SAFE") else f"{product_name}.SAFE")
     if not safe_dir.exists():
@@ -595,15 +597,14 @@ def fast_local_complete_safe(output_root: Path, product_name: str,
     if gran is None:
         return False, {"reason": "granule_missing", "safe_dir": str(safe_dir)}
 
-    r20 = gran / "IMG_DATA" / "R20m"
-    if not r20.exists():
-        return False, {"reason": "r20m_missing", "r20": str(r20)}
+    res_dir = gran / "IMG_DATA" / f"R{bands_res}m"
+    if not res_dir.exists():
+        return False, {"reason": f"r{bands_res}m_missing", f"r{bands_res}": str(res_dir)}
 
-    bands = set(bands_20m or ALLOWED_20M) | {"SCL"}
     missing = []
     present = 0
     for b in bands:
-        pat = str(r20 / f"*_{b}_20m.jp2")
+        pat = str(res_dir / f"*_{b}_{bands_res}m.jp2")
         matches = glob(pat)
         if matches:
             present += 1
@@ -630,7 +631,8 @@ def download_selected_files_from_cdse_row(
     row: pd.Series,
     session: requests.Session,
     output_dir: str | Path,
-    bands_20m: Iterable[str],
+    bands: Iterable[str],
+    bands_res: str,
     scene_csv: str | Path,
     id_col: str = "Id",
     name_col: str = "Name",
@@ -639,7 +641,7 @@ def download_selected_files_from_cdse_row(
     product_name = row[name_col]
 
     # ---- FAST LOCAL CHECK (no network) ----
-    ok, detail = fast_local_complete_safe(Path(output_dir), product_name, bands_20m, require_xml=True)
+    ok, detail = fast_local_complete_safe(Path(output_dir), product_name, bands_res, bands)
     if ok:
         # we still try to index (scene_xml parse) later if needed, but skip any node listing
         print(f"SKIP: complete for {product_name} (all bands + XML present)")
@@ -648,7 +650,7 @@ def download_selected_files_from_cdse_row(
         tile_xml_path = gran_dir / "MTD_TL.xml"
         if tile_xml_path.exists():
             try:
-                geo = parse_tile_xml(str(tile_xml_path), resolution="20")
+                geo = parse_tile_xml(str(tile_xml_path), resolution=bands_res)
                 append_scene_row(scene_csv, dict(
                     scene_id=gran_dir.name, product_name=product_name,
                     epsg=geo["epsg"], xmin=geo["xmin"], ymin=geo["ymin"], xmax=geo["xmax"], ymax=geo["ymax"],
@@ -660,7 +662,7 @@ def download_selected_files_from_cdse_row(
         return "ok"
 
     # ---- Otherwise fall back to API node listing (slower path) ----
-    targets, root, granule_dir = select_targets(session, product_id, product_name, bands_20m)
+    targets, root, granule_dir = select_targets(session, product_id, product_name, bands, bands_res)
     if not targets:
         print(f"NO TARGETS for {product_name}")
         return "error: no targets found"
@@ -702,7 +704,7 @@ def download_selected_files_from_cdse_row(
 
     scene_id = granule_dir or product_name
     try:
-        geo = parse_tile_xml(tile_xml_path, resolution="20")
+        geo = parse_tile_xml(tile_xml_path, resolution=bands_res)
         append_scene_row(scene_csv, dict(
             scene_id=scene_id, product_name=product_name,
             epsg=geo["epsg"], xmin=geo["xmin"], ymin=geo["ymin"], xmax=geo["xmax"], ymax=geo["ymax"],
@@ -718,20 +720,20 @@ def download_selected_files_from_cdse_row(
 # MASK AND OFFSET VRT BUILDER
 # ---------------------------------------------------------------------
 
-SCL_MASK_CLASSES_DEFAULT = (0, 1, 2, 3, 7, 8, 9, 10, 11)
 DST_NODATA_DEFAULT = 65535
 
 def parse_pb_from_path(p: Path) -> float | None:
     m = re.search(r"_N(\d{4})_", str(p))
     return float(m.group(1))/100 if m else None
 
+
 def write_mask_and_offset_vrt(
     band_jp2: Path,
     scl_jp2: Path,
     out_vrt: Path,
+    scl_classes: List[int],
     *,
     dst_nodata: int = 65535,
-    scl_classes: Sequence[int] = SCL_MASK_CLASSES_DEFAULT,  # 0 is force-masked below
     dn_offset: int = 0,  # e.g., 1000; pass 0 if no PB offset
 ) -> None:
     # read grid/SRS from the band
@@ -862,7 +864,7 @@ def warp_to_wgs84_vrt(
 
     ensure_dir(out_vrt.parent)
     tmp = out_vrt.with_suffix(out_vrt.suffix + ".tmp")
-    run(cmd + [str(tmp)])  # assumes your hf.run raises on nonzero return
+    run(cmd + [str(tmp)])
     tmp.replace(out_vrt)
 
 
@@ -970,13 +972,14 @@ def build_median_vrt_from_stack(stack_vrt: Path,
     n_bands = ds.RasterCount
     ds = None
 
+    src_rel = os.path.relpath(stack_vrt, out_vrt.parent)
     sources_xml = "\n".join(
         f"""    <SimpleSource>
-      <SourceFilename relativeToVRT="1">{stack_vrt}</SourceFilename>
-      <SourceBand>{i}</SourceBand>
-      <SrcRect xOff="0" yOff="0" xSize="{w}" ySize="{h}"/>
-      <DstRect xOff="0" yOff="0" xSize="{w}" ySize="{h}"/>
-    </SimpleSource>"""
+        <SourceFilename relativeToVRT="1">{src_rel}</SourceFilename>
+        <SourceBand>{i}</SourceBand>
+        <SrcRect xOff="0" yOff="0" xSize="{w}" ySize="{h}"/>
+        <DstRect xOff="0" yOff="0" xSize="{w}" ySize="{h}"/>
+        </SimpleSource>"""
         for i in range(1, n_bands + 1)
     )
 
@@ -1026,64 +1029,62 @@ def masked_median(in_ar, out_ar, *args, **kwargs):
     return out_vrt
 
 
-def warp_cutline_wkt_cli(
+def warp_cutline_wkt_py(
     src_path: Path,
     out_tif: Path,
     cutline_wkt: str,
     *,
     dst_nodata: float = -9999.0,
-    resample: str = "near",
+    resample: str = "near",  # e.g., "near","bilinear","cubic","cubicspline","lanczos","average","mode","max","min","med","q1","q3"
     num_threads: int = 1,
     creation_opts: Sequence[str] = ("TILED=YES","COMPRESS=ZSTD","PREDICTOR=2","BIGTIFF=YES"),
 ) -> Path:
-
-    # temp cutline GeoJSON beside output (so same FS)
-    geom = shp_wkt.loads(cutline_wkt)
-    gj = {"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry": mapping(geom)}]}
-
     out_tif.parent.mkdir(parents=True, exist_ok=True)
 
-    # temp output still ends with .tif so GDAL recognizes GTiff even without -of
-    tmp_out = out_tif.with_name(f".tmp_{out_tif.name}")
-    try:
-        if tmp_out.exists():
-            tmp_out.unlink()  # clean stale temp
-    except Exception:
-        pass
-
+    # Make a tiny cutline GeoJSON next to the output (same FS)
+    geom = shp_wkt.loads(cutline_wkt)
+    gj = {"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry": mapping(geom)}]}
     with tempfile.NamedTemporaryFile("w", suffix=".geojson", dir=str(out_tif.parent), delete=False) as tf:
         tf_path = Path(tf.name)
         json.dump(gj, tf)
 
+    # Ensure Python VRTs execute inside this process
+    gdal.UseExceptions()
+    gdal.SetConfigOption("GDAL_VRT_ENABLE_PYTHON", "YES")
+    gdal.SetConfigOption("GDAL_NUM_THREADS", str(num_threads))
+    gdal.SetConfigOption("GDAL_PAM_ENABLED", "NO")
+
+    tmp_out = out_tif.with_name(f".tmp_{out_tif.name}")
     try:
-        env = os.environ.copy()
-        env.setdefault("GDAL_VRT_ENABLE_PYTHON", "YES")
-        env.setdefault("GDAL_NUM_THREADS", str(num_threads))
-        env.setdefault("GDAL_PAM_ENABLED", "NO")
+        if tmp_out.exists():
+            tmp_out.unlink()
 
-        cmd = [
-            "gdalwarp",
-            "-of", "GTiff",
-            "-overwrite",
-            "-cutline", str(tf_path),
-            "-crop_to_cutline",
-            "-dstnodata", str(dst_nodata),
-            "-r", resample,
-            "-wo", f"NUM_THREADS={num_threads}",
-            "--config", "GDAL_VRT_ENABLE_PYTHON", "YES",
-            "--config", "GDAL_NUM_THREADS", str(num_threads),
-            "--config", "GDAL_PAM_ENABLED", "NO",
-        ]
-        for co in creation_opts:
-            cmd += ["-co", co]
-        cmd += [str(src_path), str(tmp_out)]
+        # Multithreading + cutline via WarpOptions
+        opts = gdal.WarpOptions(
+            format="GTiff",
+            cutlineDSName=str(tf_path),
+            cropToCutline=True,
+            dstNodata=dst_nodata,
+            resampleAlg=resample,
+            multithread=True,                                # enable threaded warper
+            warpOptions=[f"NUM_THREADS={num_threads}"],      # control thread count
+            creationOptions=list(creation_opts),
+        )
 
-        subprocess.run(cmd, check=True, env=env, capture_output=True, text=True)
+        # Run the warp
+        ds = gdal.Warp(str(tmp_out), str(src_path), options=opts)
+        if ds is None:
+            # GetLastErrorMsg() usually has the reason (e.g., VRT pixel fn issues)
+            raise RuntimeError(f"gdal.Warp returned None: {gdal.GetLastErrorMsg()}")
+        ds = None
+
         os.replace(tmp_out, out_tif)
         return out_tif
 
-    except subprocess.CalledProcessError as cpe:
-        raise RuntimeError(f"gdalwarp failed ({cpe.returncode}): {cpe.stderr.strip()}") from None
+    except Exception as e:
+        msg = gdal.GetLastErrorMsg()
+        raise RuntimeError(f"gdal.Warp failed: {e}\n{msg}") from None
+
     finally:
         try: tf_path.unlink()
         except: pass
@@ -1097,18 +1098,32 @@ def warp_cutline_wkt_cli(
 # SCENE FILE DISCOVERY
 # ---------------------------------------------------------------------
 
-def find_band_jp2s(output_root: Path, safe_names: Iterable[str], band: str) -> list[Path]:
+def find_band_jp2s_by_res(output_root: Path, safe_names: Iterable[str],
+                          band: str, res: str) -> list[Path]:
+    """
+    Return all JP2s for e.g. band='B03' at R{res}m inside the .SAFE directories.
+    res is a string: "10" | "20" | "60"
+    """
     out: list[Path] = []
+    subdir = f"R{int(res)}m"
+    patt = f"*_{band}_{res}m.jp2"
     for safe in sorted(set(safe_names)):
-        safe_dir = output_root / (safe if safe.endswith(".SAFE") else f"{safe}.SAFE")
-        out.extend(safe_dir.glob(f"GRANULE/*/IMG_DATA/R20m/*_{band}_20m.jp2"))
+        safe_dir = Path(output_root) / (safe if safe.endswith(".SAFE")
+                                        else f"{safe}.SAFE")
+        for jp2 in safe_dir.glob(f"GRANULE/*/IMG_DATA/{subdir}/{patt}"):
+            out.append(jp2)
     return out
 
-def corresponding_scl_for_band(band_jp2: Path) -> Path:
+def corresponding_scl_for_band(band_jp2: Path, band_res: str) -> Path:
     name = band_jp2.name
-    name_scl = re.sub(r'_(B02|B03|B04|B05|B06|B07|B8A|B11|B12)_20m\.jp2$',
-                      r'_SCL_20m.jp2', name)
-    return band_jp2.with_name(name_scl)
+    # Try same res first
+    pat = r'_(?:B\d{2}|B8A)_(?:10|20|60)m\.jp2$'
+    same = band_jp2.with_name(re.sub(pat, f'_SCL_{band_res}m.jp2', name))
+    if same.exists():
+        return same
+    # Fallback: most L2A deliveries include SCL at 20 m
+    fallback = band_jp2.with_name(re.sub(pat, '_SCL_20m.jp2', name))
+    return fallback
 
 def list_vrts(parent: Path, suffix: str) -> list[Path]:
     return [p for p in parent.rglob("*") if p.name.endswith(suffix)]

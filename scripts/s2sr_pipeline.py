@@ -50,42 +50,62 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     p = argparse.ArgumentParser(description="S2 L2A download + process pipeline (MPI).")
     aoi = p.add_mutually_exclusive_group(required=True)
     aoi.add_argument(
-        "--bbox", 
+        "--bbox",
         nargs=4, 
         type=float, 
         metavar=("xmin","ymin","xmax","ymax"),
         help="Bounding box for your area of interest (e.g., xmin, ymin, xmax, ymax) in lat/lon"
     )
     p.add_argument(
+        "--work_dir",
+        required=True,
+        type=Path,
+        help="Path to working environment directory"
+    )
+    p.add_argument(
         "--grid_csv",
         required=True,
+        type=Path,
         help="Path to study area grid created by 'make_grid.py' (e.g., 0.25-degree grid overlaying the Pan-Arctic)"
     )
     p.add_argument(
         "--start", 
-        required=True, 
+        required=True,
+        type=str,
         help="ISO start (e.g., 2019-06-01T00:00:00Z) for CDSE Sentinel-2 S2MSI2A product query"
     )
     p.add_argument(
         "--end", 
-        required=True, 
+        required=True,
+        type=str,
         help="ISO end (e.g., 2019-08-31T00:00:00Z) for CDSE Sentinel-2 S2MSI2A product query"
     )
     p.add_argument(
-        "--bands", 
-        nargs="+", 
-        default=["B02"], 
-        help="20m band list (SCL is auto-included); default is B02"
+        "--bands",
+        required=True,
+        nargs="+",
+        type=str,
+        default=["B02","B03","B04","B05","B06","B07","B8A","B11","B12"],
+        help="Band list (SCL is auto-included); e.g., --bands B02 B03 B04 B05 B06 B07 B8A B11 B12"
     )
     p.add_argument(
-        "--work_dir", 
-        type=Path, 
-        required=True,
-        help="Path to working environment directory"
+        "--bands_res",
+        type=int,
+        default=20,
+        choices=[10,20,60],
+        help="Band resolution in meters (10, 20, or 60)"
+    )   
+    p.add_argument(
+        "--mask-classes",
+        nargs="+",
+        type=int,
+        default=[0,1,2,3,7,8,9,10,11],
+        choices=list(range(12)),
+        help="SCL classes for masking. SCL classes are 0(no-data), 1(saturated), 2(topographic shadows), 3(cloud shadows), 4(vegetation), 5(non-vegetation), 6(water), 7(unclassified), 8(med cloud probability), 9(high cloud probability), 10(thin cirrus), 11(snow/ice)",
     )
     p.add_argument(
         "--tr", 
-        nargs=2, 
+        nargs=2,
         type=float, 
         default=None, 
         metavar=("dLon","dLat"),
@@ -209,7 +229,7 @@ def main():
 
     if rank == 0:
         selected.to_csv(SELECTED_CELLS_CSV, index=False)
-        logger.info(f"selected {len(selected)} gridcells → {SELECTED_CELLS_CSV}")
+        logger.info(f"selected {len(selected)} gridcells -> {SELECTED_CELLS_CSV}")
 
     # ---------------------------------------------------------------------
     # I.f. Create bbox for query (union of selected gridcells)
@@ -230,7 +250,7 @@ def main():
                 start_iso=args.start,
                 end_iso=args.end,
             )
-            result_df = hf.fetch_all_products(search_q, top=200)
+            result_df = hf.fetch_all_products(search_q)
 
             man = result_df[["Id","Name","ContentDate"]].copy()
             man["queried_utc"] = hf.utc_now_iso()
@@ -240,7 +260,7 @@ def main():
                 result_df["Name"].dropna().astype(str).str.rstrip("/")
                 .drop_duplicates().sort_values().tolist()
             )
-            logger.info(f"query returned {len(product_names)} products → {MANIFEST_CSV}")
+            logger.info(f"query returned {len(product_names)} products -> {MANIFEST_CSV}")
         except Exception as e:
             logger.critical(f"query failed: {e}")
             sys.exit(3)
@@ -256,8 +276,12 @@ def main():
     # ---------------------------------------------------------------------
     # I.i. [Rank 0] Download
     # ---------------------------------------------------------------------
+    target_res = str(args.bands_res)
     if rank == 0:
-        backfilled = hf.backfill_index_from_existing_xmls(OUT_DIR, SCENE_INDEX_CSV)
+        backfilled = hf.backfill_index_from_existing_xmls(
+            output_root=OUT_DIR, 
+            bands_res=target_res, 
+            csv_path=SCENE_INDEX_CSV)
         if backfilled:
             logger.info(f"backfilled {backfilled} scenes into index.")
 
@@ -279,8 +303,9 @@ def main():
         for _, row in dl_df.iterrows():
             status = hf.download_selected_files_from_cdse_row(
                 row, session, OUT_DIR,
-                bands_20m=set(args.bands) | {"SCL"},
-                scene_csv=SCENE_INDEX_CSV
+                bands=set(args.bands) | {"SCL"},
+                bands_res=target_res,
+                scene_csv=SCENE_INDEX_CSV,
             )
             if status != "ok":
                 failures.append({"Id": row["Id"], "Name": row["Name"], "status": status})
@@ -303,31 +328,42 @@ def main():
     # II.a. Per-Scene Processing [mask -> offset -> warp to WGS84]
     # #####################################################################
     # #####################################################################
-    ALLOWED_20M = {"B02","B03","B04","B05","B06","B07","B8A","B11","B12"}
-    req_20m = [b for b in args.bands if b in ALLOWED_20M]
-    ignored = [b for b in args.bands if b not in (ALLOWED_20M | {"SCL"})]
-    if ignored and rank == 0:
-        logger.warning(f"Ignoring non-20m bands in PHASE 1: {ignored} (e.g., B08 is 10 m)")
+
+    # target published resolution to use from the SAFE folders
+    req_bands = [b for b in args.bands if b.upper() != "SCL"]
 
     # ---------------------------------------------------------------------
     # II.b. Per-rank output directories
     # ---------------------------------------------------------------------
     masked_dir = rank_tmp / "masked_vrt"; masked_dir.mkdir(parents=True, exist_ok=True)
-    wgs_dir = rank_tmp / "wgs84_vrt";  wgs_dir.mkdir(parents=True, exist_ok=True)
+    wgs_dir = rank_tmp / "wgs84_vrt"; wgs_dir.mkdir(parents=True, exist_ok=True)
 
     # ---------------------------------------------------------------------
     # II.c. Discover actual JP2s present (robust to partial/previous downloads)
     # ---------------------------------------------------------------------
-    jp2s: List[Path] = []
-    for b in req_20m:
-        jp2s.extend(hf.find_band_jp2s(OUT_DIR, product_names, b))
+    # discover JP2s present for the requested resolution
+    jp2s = []
+    missing = []
+    for b in req_bands:
+        hits = hf.find_band_jp2s_by_res(OUT_DIR, product_names, b, target_res)
+        (jp2s.extend(hits) if hits else missing.append(b))
 
     if rank == 0:
-        by_band = Counter(p.name.split("_")[-2] for p in jp2s)  # 'B02', 'B8A', etc.
+        if missing:
+            logger.warning(
+                f"No {target_res} m files found for bands: {sorted(missing)} "
+                f"(they may not be provided at that res in these products)"
+            )
+        by_band = Counter(p.name.split("_")[-2] for p in jp2s)  # e.g., 'B02', 'B8A'
         logger.info(
-            f"Found {len(jp2s)} band-images across {len(product_names)} products "
-            f"and {len(req_20m)} 20m bands (per-band: {dict(sorted(by_band.items()))})"
+            f"Found {len(jp2s)} band-images across {len(product_names)} products; "
+            f"unique bands at {target_res} m: {sorted(by_band.keys())}"
         )
+
+    if not jp2s:
+        if rank == 0:
+            logger.warning("[phase1] no band JP2s found at requested resolution; nothing to process.")
+        sys.exit(0)
 
     # ---------------------------------------------------------------------
     # II.d. Split work round-robin across ranks
@@ -339,7 +375,7 @@ def main():
 
     for band_jp2 in my_jobs:
         try:
-            scl_jp2 = hf.corresponding_scl_for_band(band_jp2)
+            scl_jp2 = hf.corresponding_scl_for_band(band_jp2, target_res)
             if not scl_jp2.exists():
                 logger.warning(f"[phase1][rank {rank}] missing SCL for {band_jp2}")
                 continue
@@ -364,7 +400,7 @@ def main():
                 band_jp2,
                 scl_jp2,
                 tmp_mask,
-                scl_classes=(0,1,2,3,7,8,9,10,11),
+                scl_classes=args.mask_classes,
                 dn_offset=dn_off
             )
             tmp_mask.replace(masked_vrt)
@@ -376,9 +412,8 @@ def main():
             hf.warp_to_wgs84_vrt(
                 masked_vrt, tmp_wgs,
                 tr=tuple(args.tr) if args.tr else None,
+                te=(xmin, ymin, xmax, ymax),
                 tap=args.tap,
-                te=(xmin, ymin, xmax, ymax)  # clip to download bbox
-                # ensure helper uses -wo NUM_THREADS=1 internally
             )
             tmp_wgs.replace(wgs_vrt)
 
@@ -450,7 +485,8 @@ def main():
     # III.e. Assign ranks their tasks
     # ---------------------------------------------------------------------
     # bands we will composite (per band)
-    bands_for_phase2 = list(req_20m) if len(req_20m) else []
+    missing_set = set(missing)
+    bands_for_phase2 = [b for b in req_bands if b not in missing_set]
 
     # make (cell_id, geom, band_code) tasks
     tasks = [(cid, g, b) for cid, g in cells_df[["tile_id_rc","geometry"]].itertuples(index=False, name=None)
@@ -495,13 +531,13 @@ def main():
             # III.f.2) stack all scenes per band that intersect the gridcell bbox
             # ---------------------------------------------------------------------
             stack_vrt  = tmp_cell_dir / f"{stem}_stack.vrt"
-            hf.build_stack_vrt(scenes, cell_bbox, stack_vrt, nodata=65535)
+            hf.build_stack_vrt(scenes, cell_bbox, stack_vrt)
 
             # ---------------------------------------------------------------------
             # III.f.3) get median composite of scenes
             # ---------------------------------------------------------------------
             median_vrt = tmp_cell_dir / f"{stem}_median.vrt"
-            hf.build_median_vrt_from_stack(stack_vrt, median_vrt, nodata_in=65535, nodata_out=-9999.0)
+            hf.build_median_vrt_from_stack(stack_vrt, median_vrt)
 
             # ---------------------------------------------------------------------
             # III.f.4) clip median composite gridcell to gridcell bounds
@@ -509,10 +545,7 @@ def main():
             out_dir = comp_dir / str(cell_id)
             out_dir.mkdir(parents=True, exist_ok=True)
             out_tif = out_dir / f"{stem}_median_clip.tif"
-            hf.warp_cutline_wkt_cli(
-                median_vrt, out_tif, cutline_wkt=geom.wkt,
-                dst_nodata=-9999.0, resample="near", num_threads=1
-            )
+            hf.warp_cutline_wkt_py(median_vrt, out_tif, cutline_wkt=geom.wkt)
 
         except Exception as e:
             phase2_errors.append({"cell": cell_id, "band": band_code, "error": str(e)})
