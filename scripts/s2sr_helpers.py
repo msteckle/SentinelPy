@@ -16,30 +16,32 @@ import sys
 import shutil
 import stat
 import subprocess
+import threading
 import logging
-import sysconfig
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Sequence, Tuple, List
 from glob import glob
-from osgeo import gdal
-from typing import Iterable, Tuple, List
-import numpy as np
 import tempfile
+from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter, Retry
+from osgeo import gdal
 from shapely.geometry import box, mapping
 from shapely.geometry.base import BaseGeometry
 from shapely import wkt as shp_wkt
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
 from getpass import getpass  # fix: use function, not module
+
 
 # ---------------------------------------------------------------------
 # CONSTANTS
 # ---------------------------------------------------------------------
 CDSE_BASE = "https://download.dataspace.copernicus.eu"
 AUTH_URL  = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
+
 
 # ---------------------------------------------------------------------
 # SMALL UTILITIES
@@ -79,14 +81,18 @@ def setup_rank_logging(log_dir: Path, rank: int, level=logging.INFO) -> logging.
 
     return logger
 
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
 
 def run(cmd: Sequence[str], check=True, env: dict | None = None) -> None:
     subprocess.run(cmd, check=check, env=env)
 
+
 def ensure_dir(d: Path) -> None:
     d.mkdir(parents=True, exist_ok=True)
+
 
 def gdalinfo_json(p: Path) -> dict:
     out = subprocess.run(["gdalinfo", "-json", str(p)],
@@ -106,6 +112,7 @@ def load_gridcells(csv_path: Path) -> pd.DataFrame:
         raise ValueError(f"Grid CSV missing columns: {missing}")
     return df
 
+
 def select_intersecting_cells(aoi: BaseGeometry, grid: pd.DataFrame) -> pd.DataFrame:
     axmin, aymin, axmax, aymax = aoi.bounds
     rough = grid.loc[
@@ -122,6 +129,7 @@ def select_intersecting_cells(aoi: BaseGeometry, grid: pd.DataFrame) -> pd.DataF
     if not out.empty:
         out = out.sort_values(["row","col"]).reset_index(drop=True)
     return out
+
 
 def union_bounds(df_cells: pd.DataFrame) -> tuple[float,float,float,float]:
     return (df_cells["xmin"].min(), df_cells["ymin"].min(),
@@ -142,6 +150,7 @@ def fetch_all_products(base_query: str, top: int = 200, timeout: int = 60) -> pd
         url = j.get("@odata.nextLink")
     return pd.DataFrame(items)
 
+
 def build_search_query(
     aoi: BaseGeometry,
     catalogue_odata: str,
@@ -160,12 +169,14 @@ def build_search_query(
         f"and ContentDate/Start gt {start_iso} and ContentDate/Start lt {end_iso}"
     )
 
+
 # ---------------------------------------------------------------------
 # AUTH & SESSION
 # ---------------------------------------------------------------------
 
 def _now() -> float: 
     return time.time()
+
 
 def _password_grant(credentials: dict) -> dict:
     data = {
@@ -178,6 +189,7 @@ def _password_grant(credentials: dict) -> dict:
     r.raise_for_status()
     return r.json()
 
+
 def _refresh_grant(refresh_token: str) -> dict:
     data = {
         "client_id": "cdse-public",
@@ -188,6 +200,7 @@ def _refresh_grant(refresh_token: str) -> dict:
     r.raise_for_status()
     return r.json()
 
+
 def _read_secret_file(path: str | None) -> str | None:
     if not path:
         return None
@@ -197,6 +210,7 @@ def _read_secret_file(path: str | None) -> str | None:
     if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
         raise RuntimeError(f"Insecure permissions on {p}; run: chmod 600 {p}")
     return p.read_text(encoding="utf-8").strip()
+
 
 def get_access_token(credentials: dict, token_cache: dict, *, force_refresh: bool=False) -> str:
     """
@@ -260,10 +274,6 @@ def get_access_token(credentials: dict, token_cache: dict, *, force_refresh: boo
     token_cache["refresh_expires_at"] = now + int(j.get("refresh_expires_in", 0) or 0)
     return token_cache["access_token"]
 
-def make_cdse_session(credentials: dict, token_cache: dict, *, force_refresh: bool=False) -> requests.Session:
-    s = requests.Session()
-    s.headers.update({"Authorization": f"Bearer {get_access_token(credentials, token_cache, force_refresh=force_refresh)}"})
-    return s
 
 # ---------------------------------------------------------------------
 # NODE BROWSER
@@ -280,6 +290,7 @@ def _nodes_url(product_id, *segments, list_children: bool = False) -> str:
     path += "/Nodes" if list_children else "/$value"
     return path
 
+
 def list_children(session: requests.Session, product_id, *segments) -> list[dict]:
     """
     List children of a node. For top-level, call with only (session, product_id).
@@ -289,6 +300,7 @@ def list_children(session: requests.Session, product_id, *segments) -> list[dict
     r = session.get(url, timeout=60)
     r.raise_for_status()
     return r.json().get("result", [])
+
 
 def find_safe_root_node(session: requests.Session, product_id) -> str:
     """
@@ -303,11 +315,13 @@ def find_safe_root_node(session: requests.Session, product_id) -> str:
             return nm
     return kids[0]["Name"]  # fallback
 
+
 def extract_tile_from_name(product_name: str) -> str | None:
     for part in str(product_name).split("_"):
         if part.startswith("T") and len(part) == 6:
             return part
     return None
+
 
 def select_targets(session: requests.Session, product_id, product_name: str,
                    bands: Iterable[str], bands_res: str) -> tuple[list[tuple], str, str | None]:
@@ -346,6 +360,7 @@ def select_targets(session: requests.Session, product_id, product_name: str,
     targets.append((root, "MTD_MSIL2A.xml"))
     return targets, root, granule_dir
 
+
 def relpath_for_segments(segments: Sequence[str], include_safe_root: bool = True,
                          pb_tag: str | None = None) -> str:
     if include_safe_root:
@@ -356,6 +371,7 @@ def relpath_for_segments(segments: Sequence[str], include_safe_root: bool = True
     if pb_tag:
         fname = f"{base}_{pb_tag}{ext}"
     return os.path.join(*parts[1:-1], fname)
+
 
 def download_node(session: requests.Session, product_id, segments: Sequence[str],
                   output_root: str | Path, *,
@@ -398,6 +414,86 @@ def download_node(session: requests.Session, product_id, segments: Sequence[str]
                 os.remove(tmp)
         finally:
             return f"write error: {ex}"
+        
+
+class AutoRefreshSession(requests.Session):
+    _refresh_lock = threading.Lock()
+
+    def __init__(self, credentials: dict, token_cache: dict, logger: logging.Logger | None = None):
+        super().__init__()
+        self._credentials = credentials
+        self._token_cache = token_cache
+        self._logger = logger
+
+        tok = get_access_token(self._credentials, self._token_cache, force_refresh=False)
+        self.headers.update({"Authorization": f"Bearer {tok}"})
+
+        retries = Retry(
+            total=5, backoff_factor=1.0,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "POST"])
+        )
+        adapter = HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=retries)
+        self.mount("https://", adapter)
+        self.mount("http://", adapter)
+
+    def request(self, method, url, **kwargs):
+        r = super().request(method, url, **kwargs)
+        if r.status_code == 401:
+            if self._logger:
+                self._logger.info("token expired; refreshing and retrying once...")
+            with AutoRefreshSession._refresh_lock:
+                new_tok = get_access_token(self._credentials, self._token_cache, force_refresh=True)
+                self.headers["Authorization"] = f"Bearer {new_tok}"
+            r = super().request(method, url, **kwargs)
+        return r
+
+
+def make_auto_session(credentials: dict, token_cache: dict, logger: logging.Logger | None = None) -> AutoRefreshSession:
+    return AutoRefreshSession(credentials, token_cache, logger=logger)
+
+
+def download_rows_concurrent(
+    df: pd.DataFrame,
+    output_dir: Path,
+    bands: Iterable[str],
+    bands_res: str,
+    scene_csv: Path,
+    *,
+    max_workers: int = 2,
+    logger: logging.Logger | None = None,
+) -> list[dict]:
+    """Download rows concurrently (at most max_workers at a time).
+    Returns a list of failure dicts [{Id, Name, status}, ...]."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    CRED: dict = {}
+    TOK: dict = {}
+
+    def one(row: pd.Series) -> tuple[str, str, str]:
+        name = row.get("Name", "unknown")
+        pid = row.get("Id", "")
+        try:
+            with make_auto_session(CRED, TOK, logger=logger) as sess:
+                status = download_selected_files_from_cdse_row(
+                    row, sess, output_dir,
+                    bands=bands, bands_res=bands_res, scene_csv=scene_csv
+                )
+            return (pid, name, status)
+        except Exception as e:
+            return (pid, name, f"exception: {e}")
+
+    failures: list[dict] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(one, row) for _, row in df.iterrows()]
+        for fut in as_completed(futs):
+            pid, name, status = fut.result()
+            if status != "ok":
+                failures.append({"Id": pid, "Name": name, "status": status})
+                if logger:
+                    logger.warning(f"download failed for {name} ({pid}): {status}")
+    return failures
+
 
 # ---------------------------------------------------------------------
 # INDEXING
@@ -407,11 +503,13 @@ def _local(el):
     t = el.tag
     return t.split('}', 1)[1].lower() if '}' in t else t.lower()
 
+
 def _num(s):
     if s is None:
         return None
     m = re.search(r'(-?\d+(?:\.\d+)?)', str(s))
     return float(m.group(1)) if m else None
+
 
 def _get_child_text(el, name):
     lname = name.lower()
@@ -419,6 +517,7 @@ def _get_child_text(el, name):
         if _local(ch) == lname:
             return ch.text
     return None
+
 
 def _res_from(el):
     for k, v in el.attrib.items():
@@ -431,6 +530,7 @@ def _res_from(el):
         return rv
     m = re.search(r'(\d+)\s*m?$', _local(el))
     return float(m.group(1)) if m else None
+
 
 def parse_tile_xml(xml_path: str, resolution: str) -> dict:
     target = int(float(resolution))
@@ -501,6 +601,7 @@ def parse_tile_xml(xml_path: str, resolution: str) -> dict:
         ncols=int(ncols), nrows=int(nrows),
     )
 
+
 def append_scene_row(csv_path: Path, row: dict):
     fields = ["scene_id","product_name","epsg","xmin","ymin","xmax","ymax",
               "xres","yres","ncols","nrows","tile_xml_path","added_utc"]
@@ -516,6 +617,7 @@ def append_scene_row(csv_path: Path, row: dict):
         if write_header:
             w.writeheader()
         w.writerow({k: row.get(k) for k in fields})
+
 
 def append_scene_rows_bulk(csv_path: Path, rows: list[dict]) -> int:
     fields = ["scene_id","product_name","epsg","xmin","ymin","xmax","ymax",
@@ -540,6 +642,7 @@ def append_scene_rows_bulk(csv_path: Path, rows: list[dict]) -> int:
             wrote += 1
     return wrote
 
+
 def backfill_index_from_existing_xmls(output_root: str | Path, bands_res: str, csv_path: Path) -> int:
     rows = []
     for xml in Path(output_root).glob("**/GRANULE/*/MTD_T*.xml"):
@@ -559,6 +662,7 @@ def backfill_index_from_existing_xmls(output_root: str | Path, bands_res: str, c
         ))
     wrote = append_scene_rows_bulk(csv_path, rows)
     return wrote
+
 
 # ---------------------------------------------------------------------
 # DOWNLOAD ONE PRODUCT
@@ -626,6 +730,7 @@ def fast_local_complete_safe(output_root: Path, product_name: str,
         "granule_dir": str(gran),
         "safe_dir": str(safe_dir),
     }
+
 
 def download_selected_files_from_cdse_row(
     row: pd.Series,
@@ -715,6 +820,7 @@ def download_selected_files_from_cdse_row(
         print(f"INDEX ERROR parsing {tile_xml_path}: {e}")
 
     return "ok"
+
 
 # ---------------------------------------------------------------------
 # MASK AND OFFSET VRT BUILDER
@@ -830,6 +936,7 @@ def mask_and_offset(in_ar, out_ar, *args, **kwargs):
     tmp = out_vrt.with_suffix(out_vrt.suffix + ".tmp")
     tmp.write_text(vrt_xml)
     tmp.replace(out_vrt)
+
 
 def warp_to_wgs84_vrt(
     src_vrt: Path,
@@ -1114,6 +1221,7 @@ def find_band_jp2s_by_res(output_root: Path, safe_names: Iterable[str],
             out.append(jp2)
     return out
 
+
 def corresponding_scl_for_band(band_jp2: Path, band_res: str) -> Path:
     name = band_jp2.name
     # Try same res first
@@ -1125,8 +1233,6 @@ def corresponding_scl_for_band(band_jp2: Path, band_res: str) -> Path:
     fallback = band_jp2.with_name(re.sub(pat, '_SCL_20m.jp2', name))
     return fallback
 
-def list_vrts(parent: Path, suffix: str) -> list[Path]:
-    return [p for p in parent.rglob("*") if p.name.endswith(suffix)]
 
 # ---------------------------------------------------------------------
 # CLEANUP

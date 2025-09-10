@@ -131,33 +131,6 @@ def mpi_scatter_roundrobin(items: List[Any], rank: int, size: int):
     return [items[i] for i in range(rank, len(items), size)]
 
 # ---------------------------------------------------------------------
-# Auth: session that auto-refreshes on 401
-# ---------------------------------------------------------------------
-class AutoRefreshSession(requests.Session):
-    """
-    requests.Session that:
-      - gets an access_token via hf.get_access_token (env/secret-file aware)
-      - on HTTP 401, refreshes token (uses refresh_token; falls back to password)
-    """
-    def __init__(self, credentials: Dict[str, Any], token_cache: Dict[str, Any], logger: logging.Logger | None = None):
-        super().__init__()
-        self._credentials = credentials
-        self._token_cache = token_cache
-        self._logger = logger
-        tok = hf.get_access_token(self._credentials, self._token_cache, force_refresh=False)
-        self.headers.update({"Authorization": f"Bearer {tok}"})
-
-    def request(self, method, url, **kwargs):
-        r = super().request(method, url, **kwargs)
-        if r.status_code == 401:
-            if self._logger:
-                self._logger.info("token expired; refreshing and retrying once...")
-            new_tok = hf.get_access_token(self._credentials, self._token_cache, force_refresh=True)
-            self.headers["Authorization"] = f"Bearer {new_tok}"
-            r = super().request(method, url, **kwargs)
-        return r
-
-# ---------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------
 def main():
@@ -279,44 +252,30 @@ def main():
     target_res = str(args.bands_res)
     if rank == 0:
         backfilled = hf.backfill_index_from_existing_xmls(
-            output_root=OUT_DIR, 
-            bands_res=target_res, 
-            csv_path=SCENE_INDEX_CSV)
+            output_root=OUT_DIR, bands_res=target_res, csv_path=SCENE_INDEX_CSV)
         if backfilled:
             logger.info(f"backfilled {backfilled} scenes into index.")
-
-        CRED: Dict[str, Any] = {}
-        TOK: Dict[str, Any] = {}
-        try:
-            session = AutoRefreshSession(CRED, TOK, logger=logger)
-            logger.info(f"downloading {len(product_names)} .SAFE products (missing only) to {OUT_DIR}")
-        except Exception as e:
-            logger.critical(f"login failed: {e}")
-            sys.exit(6)
 
         dl_df = result_df if (result_df is not None and "Id" in result_df.columns) else None
         if dl_df is None:
             logger.warning("missing result_df Ids; cannot proceed with downloads.")
             sys.exit(4)
 
-        failures: List[Dict[str, Any]] = []
-        for _, row in dl_df.iterrows():
-            status = hf.download_selected_files_from_cdse_row(
-                row, session, OUT_DIR,
-                bands=set(args.bands) | {"SCL"},
-                bands_res=target_res,
-                scene_csv=SCENE_INDEX_CSV,
-            )
-            if status != "ok":
-                failures.append({"Id": row["Id"], "Name": row["Name"], "status": status})
-                logger.warning(f"download failed for {row['Name']} ({row['Id']}): {status}")
-
+        logger.info(f"downloading {len(dl_df)} .SAFE products (missing only) to {OUT_DIR} with max 2 concurrent workers")
+        failures = hf.download_rows_concurrent(
+            dl_df, OUT_DIR, bands=set(args.bands) | {"SCL"},
+            bands_res=str(args.bands_res),
+            scene_csv=SCENE_INDEX_CSV,
+            max_workers=2,
+            logger=logger,
+        )
         if failures:
             fail_csv = INDEX_DIR / "failed_downloads.csv"
             pd.DataFrame(failures).to_csv(fail_csv, index=False)
             logger.warning(f"{len(failures)} downloads failed → {fail_csv}")
         else:
             logger.info("download/check complete (all ok).")
+
 
     # ---------------------------------------------------------------------
     # I.j. Sync all ranks before continuing
