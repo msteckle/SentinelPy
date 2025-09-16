@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Point to your venv and OpenMPI install here
-VENV_DIR="/mnt/poseidon/remotesensing/arctic/data/rasters/s2_sr/.venv"
+VENV_DIR="/mnt/poseidon/remotesensing/arctic/data/rasters/esa_sentinel/.venv"
 OPENMPI_PREFIX="$HOME/opt/openmpi-5.0.5" 
 
 # Activate venv
@@ -20,21 +20,24 @@ if ! command -v mpirun >/dev/null 2>&1; then
   fi
 fi
 
+# export relevant env vars for SNAP and GDAL
 export EARTHDATA_USER="msteckler98" # supply your own username
 export EARTHDATA_PASS="$(< $HOME/.earthdata/earthdata_pw)" # supply your own password
+export SNAP_USER_DIR="/mnt/poseidon/remotesensing/6ru/.snap"
 export GDAL_VRT_ENABLE_PYTHON=YES
 
 # --bbox here is a 3x3-degree box centered over Toolik station
 mpirun -x EARTHDATA_USER -x EARTHDATA_PASS -n 10 python s1grd_pipeline.py \
   --bbox -150 67 -148 69 \
-  --work_dir /mnt/poseidon/remotesensing/arctic/data/rasters/s1_grd \
-  --grid_csv /mnt/poseidon/remotesensing/arctic/data/rasters/s2_sr/panarctic_grid/panarctic_0p25_gridcells.csv \
+  --work_dir /mnt/poseidon/remotesensing/arctic/data/rasters/esa_sentinel/s1_grd \
+  --grid_csv /mnt/poseidon/remotesensing/arctic/data/rasters/esa_sentinel/s2_sr/panarctic_grid/panarctic_0p25_gridcells.csv \
   --start 2019-06-01T00:00:00Z --end 2019-08-31T00:00:00Z \
-  --snap-xml /mnt/poseidon/remotesensing/arctic/data/rasters/s1_grd/scripts/GEEPreprocessing.xml \
-  --snap-props /mnt/poseidon/remotesensing/arctic/data/rasters/s1_grd/scripts/GEEPreprocessing.properties \
+  --snap-xml /mnt/poseidon/remotesensing/arctic/data/rasters/esa_sentinel/s1_grd/scripts/GEEPreprocessing.xml \
+  --snap-props /mnt/poseidon/remotesensing/arctic/data/rasters/esa_sentinel/s1_grd/scripts/GEEPreprocessing.properties \
   --gpt-bin /mnt/poseidon/remotesensing/6ru/apps/snap-9.0.0/bin/gpt \
-  --snap-outdir /mnt/poseidon/remotesensing/arctic/data/rasters/s1_grd/tmp/snap_outputs \
+  --snap-userdir $SNAP_USER_DIR \
+  --snap-outdir /mnt/poseidon/remotesensing/arctic/data/rasters/esa_sentinel/s1_grd/snap_outputs \
   --snap-prefix Orb_NR_Cal_TC \
-  --snap-format GeoTIFF-BigTIFF \
+  --snap-overwrite \
   --tr 0.000179663056824 0.000179663056824 \
   --tap \

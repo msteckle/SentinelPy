@@ -10,7 +10,7 @@ Dependencies:
 from __future__ import annotations
 import os, json, time, subprocess
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple, Dict
+from typing import Iterable, List, Optional, Tuple, Sequence, Union
 
 import shutil
 import shlex
@@ -24,6 +24,7 @@ from shapely.ops import transform as shp_transform
 from pyproj import Transformer
 import logging
 from datetime import datetime
+from lxml import etree
 
 import asf_search as asf
 
@@ -62,6 +63,7 @@ def setup_rank_logger(
     Per-rank logger that writes to logs/<name>_rank{rank}[_{YYYYmmdd-HHMMSS}].log
     and also mirrors to console. No rotation — delete whenever you want.
     """
+    rank = rank + 1
     log_dir.mkdir(parents=True, exist_ok=True)
 
     if level is None:
@@ -69,7 +71,7 @@ def setup_rank_logger(
         level = getattr(logging, level_name, logging.INFO)
 
     # filename (optionally include run timestamp)
-    suffix = f"_{datetime.now().strftime('%Y%m%d-%H%M%S')}" if per_run_suffix else ""
+    suffix = f"_{datetime.now().strftime('%Y%m%d')}" if per_run_suffix else ""
     logfile = log_dir / f"{name}_rank{rank}{suffix}.log"
 
     logger_name = f"{name}.rank{rank}"
@@ -107,32 +109,6 @@ def setup_rank_logger(
 
 
 # ---------------------------------------------------------------------
-# Grid
-# ---------------------------------------------------------------------
-
-def load_grid_tasks_once(grid_csv: Path, aoi_bbox: Tuple[float, float, float, float]):
-    """Read grid once, intersect with AOI (EPSG:4326), return [(tile_id, WKT), ...]."""
-    df = pd.read_csv(grid_csv)
-    need = {"xmin","ymin","xmax","ymax"}
-    if not need.issubset(df.columns):
-        raise ValueError(f"{grid_csv} must contain columns {need}")
-    df["tile_id"] = df["tile_id_rc"] if "tile_id_rc" in df.columns else df.index.astype(str)
-
-    gdf = gpd.GeoDataFrame(
-        df,
-        geometry=[box(xmin, ymin, xmax, ymax) for xmin, ymin, xmax, ymax in df[["xmin","ymin","xmax","ymax"]].to_numpy()],
-        crs="EPSG:4326",
-    )
-    aoi_poly = box(*aoi_bbox)
-    cand = list(gdf.sindex.intersection(aoi_poly.bounds))
-    sel = gdf.iloc[cand]
-    sel = sel[sel.intersects(aoi_poly)].copy()
-    if sel.empty:
-        raise RuntimeError("No grid cells intersect AOI.")
-    sel["wkt"] = sel.geometry.to_wkt()
-    return list(sel[["tile_id","wkt"]].itertuples(index=False, name=None))
-
-# ---------------------------------------------------------------------
 # ASF search & download
 # ---------------------------------------------------------------------
 
@@ -146,7 +122,7 @@ def asf_search_aoi(
 ) -> pd.DataFrame:
     """Return manifest pandas dataframe with unique URLs."""
 
-    asf.CMR_TIMEOUT = 60
+    asf.constants.INTERNAL.CMR_TIMEOUT = 60
     lvls = [getattr(asf.PRODUCT_TYPE, p) for p in product_levels]
     results = asf.search(
         platform=asf.PLATFORM.SENTINEL1,
@@ -210,99 +186,116 @@ def download_asf_urls(urls, out_dir, username=None, password=None, token=None, p
     ]
     return msgs
 
-# ---------------------------------------------------------------------
-# SNAP (gpt): basic funcs
-# ---------------------------------------------------------------------
-
-_ORB_RE = re.compile(
-    r"(?P<sat>S1[AB])_OPER_AUX_(?P<otype>POEORB|RESORB)_.*?_V(?P<vstart>\d{8}T\d{6})_(?P<vstop>\d{8}T\d{6})\.EOF$"
-)
-
-def _scene_id_from_zip(zip_path: str) -> str:
-    # e.g., "/path/.../S1A_IW_GRDH_..._2A1F.zip" -> "S1A_IW_GRDH_..._2A1F"
-    return Path(zip_path).stem
-
 
 # ---------------------------------------------------------------------
 # SNAP (gpt): get orbit files via s1_orbits
 # ---------------------------------------------------------------------
 
 
-def _dest_path_for_orbit(shared_root: Path, orbit_name: str) -> Path:
-    m = _ORB_RE.match(orbit_name)
-    if not m:
-        # fail and exit rather than guessing
-        raise ValueError(f"Unrecognized orbit filename: {orbit_name}")
-    sat = m["sat"]
-    vstart = m["vstart"]
-    y = int(vstart[:4])
-    mth = int(vstart[4:6])
-    return shared_root / "Orbits" / "Sentinel-1" / "POEORB" / sat / f"{y:04d}" / f"{mth:02d}" / orbit_name
+_ORB_RE = re.compile(
+    r"(?P<sat>S1[AB])_OPER_AUX_(?P<otype>POEORB|RESORB)_.*?_V(?P<vstart>\d{8}T\d{6})_(?P<vstop>\d{8}T\d{6})\.EOF$"
+)
+
+def dest_path_from_orbit(user_dir: Path, orbit_name: str) -> Path:
+    """
+    Compute SNAP auxdata destination for a *POEORB* orbit filename.
+    user_dir should be the SNAP user dir (i.e., SNAP_USER_DIR), not auxdata root.
+    """
+    matches = _ORB_RE.match(orbit_name)
+    if not matches:
+        return None
+
+    sat = matches["sat"]  # S1A or S1B
+    vstart = matches["vstart"]  # e.g., 20190601T235944
+    year = int(vstart[:4])
+    month = int(vstart[4:6])
+
+    # SNAP stores under: $SNAP_USER_DIR/auxdata/Orbits/Sentinel-1/POEORB/S1A/YYYY/MM/...
+    return user_dir / "auxdata" / "Orbits" / "Sentinel-1" / "POEORB" / sat / f"{year:04d}" / f"{month:02d}" / orbit_name
 
 
-def ensure_poeorb_via_s1_orbits(zip_paths: List[str], shared_root: Path, require_poeorb: bool = True) -> List[str]:
+def ensure_poeorb_via_s1_orbits(
+    zip_paths: Sequence[Union[str, Path]],
+    user_dir: Path,
+    temp_dir: Path,
+) -> List[str]:
     """
-    For each ZIP, download the orbit file into `shared_root/` via s1_orbits,
-    then place it under:
-      shared_root/Orbits/Sentinel-1/POEORB/<SAT>/<YYYY>/<MM>/<file>.EOF
+    For each SCENE ZIP, download the corresponding orbit via s1_orbits.fetch_for_scene(scene_id, dir=...),
+    and place it under $SNAP_USER_DIR/auxdata/Orbits/Sentinel-1/POEORB/<SAT>/<YYYY>/<MM>/<file>.EOF
+    Skips non-POEORB (i.e., RESORB) files.
     """
+
+    # ensure s1_orbits directory is configured
     msgs: List[str] = []
-    shared_root.mkdir(parents=True, exist_ok=True)
+    temp_orbit_dir = temp_dir / "orbits"
+    ensure_dir(temp_orbit_dir)
 
-    for z in zip_paths:
-        scene_id = _scene_id_from_zip(z)
+    # loop over zips
+    for zip_path in zip_paths:
+        zip_path = Path(zip_path)
+        scene_id = zip_path.stem
+
+        # fetch orbit file to temp dir
         try:
-            # download directly into shared_root (no more files landing in scripts/)
-            dl_path = Path(s1_orbits.fetch_for_scene(scene_id, dir=shared_root))
+            download_path = Path(s1_orbits.fetch_for_scene(scene_id, dir=temp_orbit_dir))
         except Exception as e:
-            msgs.append(f"ERR  {Path(z).name}: fetch failed ({e})")
+            msgs.append(f"ERR  {zip_path.name}: fetch failed ({e})")
             continue
 
-        # normalize and validate
+        orbit_name = download_path.name
+
+        # only keep POEORB files
+        if "POEORB" not in orbit_name:
+            msgs.append(f"SKIP {zip_path.name}: not a POEORB file ({orbit_name})")
+            try:
+                download_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            continue
+
+        # compute dest path
         try:
-            dl_path = dl_path.resolve()
-        except FileNotFoundError:
-            msgs.append(f"ERR  {scene_id}: downloaded file missing ({dl_path})")
+            dest_path = dest_path_from_orbit(user_dir, orbit_name)
+        except Exception as e:
+            msgs.append(f"ERR  {zip_path.name}: {e}")
+            try:
+                download_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             continue
 
-        name = dl_path.name
-        m = _ORB_RE.match(name)
-        if not m:
-            # clean up unexpected downloads
-            try: dl_path.unlink()
-            except Exception: pass
-            msgs.append(f"ERR  {scene_id}: unrecognized orbit filename {name}")
+        # if dest path could not be computed
+        if dest_path is None:
+            msgs.append(f"ERR  {zip_path.name}: could not parse orbit filename ({orbit_name})")
+            try:
+                download_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             continue
 
-        # Respect POEORB requirement
-        if require_poeorb and m["otype"] != "POEORB":
-            # remove the RESORB we just fetched (keep cache clean)
-            try: dl_path.unlink()
-            except Exception: pass
-            msgs.append(f"SKIP {scene_id}: got {name} (RESORB); require_poeorb=True")
+        # skip if already present
+        if dest_path.exists() and dest_path.stat().st_size > 0:
+            msgs.append(f"SKIP {zip_path.name}: already present at {dest_path}")
+            try:
+                download_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             continue
 
-        # Final destination in SNAP-style tree
-        dest = _dest_path_for_orbit(shared_root, name)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-
-        if dest.exists() and dest.stat().st_size > 0:
-            # We already have it—discard duplicate download
-            if dl_path != dest:
-                try: dl_path.unlink()
-                except Exception: pass
-            msgs.append(f"SKIP {name} (exists)")
-            continue
-
-        # Move into place (atomic if same FS), else copy+unlink
+        # move orbit file into final location and remove temp file
+        ensure_dir(dest_path.parent)
         try:
-            os.replace(dl_path, dest)
-        except Exception:
-            shutil.copy2(dl_path, dest)
-            try: dl_path.unlink()
-            except Exception: pass
-
-        msgs.append(f"OK   {dest.relative_to(shared_root)}")
+            os.replace(download_path, dest_path)
+            try:
+                os.chmod(dest_path, 0o644)
+            except Exception:
+                pass
+        except Exception as e:
+            msgs.append(f"ERR  {zip_path.name}: move to {dest_path} failed ({e})")
+            try:
+                download_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     return msgs
 
@@ -314,21 +307,23 @@ import urllib.request, tempfile
 
 EGM96_URL = "http://step.esa.int/auxdata/dem/egm96/ww15mgh_b.zip"
 
-def ensure_egm96_present(auxdata_dir: Path, logger: logging.Logger) -> Path:
+def ensure_egm96_present(user_dir: Path, logger: logging.Logger) -> Path:
     """
-    Ensure <auxdata_dir>/dem/egm96/ww15mgh_b.zip exists and is non-empty.
+    Ensure <user_dir>/auxdata/dem/egm96/ww15mgh_b.zip exists and is non-empty.
     If missing/empty, download atomically. Returns the path.
     """
-    egm_dir = auxdata_dir / "dem" / "egm96"
-    egm_dir.mkdir(parents=True, exist_ok=True)
+    # ensure target dir exists
+    egm_dir = user_dir / "auxdata" / "dem" / "egm96"
+    ensure_dir(egm_dir)
     egm_zip = egm_dir / "ww15mgh_b.zip"
 
+    # already present?
     if egm_zip.exists() and egm_zip.stat().st_size > 0:
         logger.info(f"EGM96 present: {egm_zip} ({egm_zip.stat().st_size} bytes)")
         return egm_zip
 
-    logger.info(f"EGM96 not found; downloading to {egm_zip} …")
-    # Download to a temp file in the same directory, then move into place
+    # download to a temp file in the same directory, then move into place
+    logger.info(f"EGM96 not found; downloading to {egm_zip} ...")
     with tempfile.NamedTemporaryFile(dir=str(egm_dir), delete=False) as tf:
         tmp_path = Path(tf.name)
     try:
@@ -341,14 +336,20 @@ def ensure_egm96_present(auxdata_dir: Path, logger: logging.Logger) -> Path:
         size = tmp_path.stat().st_size
         if size == 0:
             raise RuntimeError("Downloaded EGM96 file is size 0")
+        
+        # move into place
         os.replace(tmp_path, egm_zip)
-        try: os.chmod(egm_zip, 0o644)
-        except Exception: pass
+        try: 
+            os.chmod(egm_zip, 0o644)
+        except Exception: 
+            pass
         logger.info(f"EGM96 downloaded: {egm_zip} ({size} bytes)")
         return egm_zip
     except Exception as e:
-        try: tmp_path.unlink(missing_ok=True)
-        except Exception: pass
+        try: 
+            tmp_path.unlink(missing_ok=True)
+        except Exception: 
+            pass
         raise
 
 
@@ -356,94 +357,54 @@ def ensure_egm96_present(auxdata_dir: Path, logger: logging.Logger) -> Path:
 # SNAP (gpt): core processing
 # ---------------------------------------------------------------------
 
-def _link_shared_auxdata(userdir: Path, auxdata_dir: Path) -> None:
-    auxdata_dir = auxdata_dir.resolve()
-    local = userdir / "auxdata"
-    local.parent.mkdir(parents=True, exist_ok=True)
+def remove_beam_dimap(out_dim: Path, logger=None):
+    """
+    Delete a BEAM-DIMAP product: the .data dir and the .dim file.
+    """
+    out_dim = Path(out_dim)
+    if out_dim.suffix.lower() != ".dim":
+        raise ValueError(f"Expected a .dim path, got: {out_dim}")
 
-    # replace whatever is there
-    try:
-        if local.is_symlink():
-            local.unlink(missing_ok=True)
-        elif local.exists():
-            shutil.rmtree(local, ignore_errors=True)
-    except Exception:
-        pass
+    data_dir = out_dim.with_suffix(".data")  # foo.dim -> foo.data
 
-    local.symlink_to(auxdata_dir, target_is_directory=True)
+    # remove .data directory first
+    if data_dir.exists():
+        if data_dir.is_dir():
+            if logger: logger.debug(f"Removing directory: {data_dir}")
+            shutil.rmtree(data_dir)
+        else:
+            # very rare, but just in case
+            if logger: logger.debug(f"Removing file: {data_dir}")
+            data_dir.unlink()
 
-
-def snap_userdir(base_work_dir: Path) -> Path:
-    # persistent, not under tmp
-    return base_work_dir / "snap_user"
-
-
-def verify_aux_visibility(userdir: Path, logger: logging.Logger) -> None:
-    """Log what SNAP will see and raise if the EGM96 file is missing."""
-    aux = userdir / "auxdata"
-    egm = aux / "dem" / "egm96" / "ww15mgh_b.zip"
-    logger.info(f"SNAP userdir: {userdir}")
-    logger.info(f"SNAP auxdata symlink: {aux} -> {aux.resolve() if aux.exists() else 'MISSING'}")
-    if not egm.exists() or egm.stat().st_size == 0:
-        raise RuntimeError(
-            f"EGM96 not found at {egm} — place ww15mgh_b.zip there or disable <externalDEMApplyEGM>."
-        )
-    logger.info(f"EGM96 present: {egm} ({egm.stat().st_size} bytes)")
-
+    # then remove the .dim
+    if out_dim.exists():
+        if logger: logger.debug(f"Removing file: {out_dim}")
+        out_dim.unlink()
 
 def run_snap_gpt(
     zip_path: str,
     gpt_bin: str,
     graph_xml: str,
-    prop_file: str | None,
+    prop_file: str,
     out_path: str,
-    out_format: str,
-    user_dir: Path,
-    tmp_dir: Path,
-    shared_aux_root: Path,
-    q_threads: int = 12,
-    cache_gb: str = "8G",
+    user_dir: str,
 ) -> None:
-    
-    # prepare dirs
-    jtmp = tmp_dir / "java_tmp"
-    ensure_dir(jtmp)
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-
-    # link shared auxdata if given
-    if shared_aux_root is not None:
-        _link_shared_auxdata(user_dir, shared_aux_root)
 
     # build command
     cmd = [
         gpt_bin, graph_xml,
         "-e",
-        "-q", str(q_threads),
-        "-c", cache_gb,
-        "-f", out_format,
-        "-t", out_path,
-    ]
-    if prop_file:
-        cmd += ["-p", prop_file]
-    cmd += [
+        # system properties
         f"-Dsnap.userdir={user_dir}",
-        f"-Duser.home={user_dir}",
-        f"-Djava.io.tmpdir={jtmp}",
-        "-Dsnap.engine.skipUpdateCheck=true",
-        "-Dsnap.ui.disabled=true",
-        "-Ds1tbx.downloadAuxData=false",
-        "-Dsnap.product.library.disable=true",
-        "-Dceres.logging.level=FINE",
+        # graph properties
+        "-p", prop_file,
+        "-t", str(out_path),
         zip_path,
     ]
 
-    env = os.environ.copy()
-    env["HOME"] = str(user_dir)
-    env["XDG_CACHE_HOME"] = str(user_dir / ".cache")
-    env["XDG_CONFIG_HOME"] = str(user_dir / ".config")
-
     # execute command
-    rc = subprocess.call(cmd, env=env)
+    rc = subprocess.call(cmd)
     if rc != 0:
         raise RuntimeError(f"gpt failed (rc={rc}) for {zip_path}\nCMD: {' '.join(cmd)}")
 
@@ -501,69 +462,36 @@ def build_scene_index(all_proc: List[str]) -> Tuple[str, gpd.GeoDataFrame]:
 # Per-cell VRT warp + median → UInt16 dB
 # ---------------------------------------------------------------------
 
-def warp_one_source_to_cell_vrt(
-    src_path: str, band_index: int, geom_dst, dst_srs: str, xres: float, yres: float, tap: bool=True
-) -> str:
-    """Warp a single source band to the cell grid as a /vsimem VRT and return its path."""
-    xmin, ymin, xmax, ymax = geom_dst.bounds
-    vrt_path = f"/vsimem/{Path(src_path).stem}_{abs(hash((xmin,ymin,xmax,ymax,band_index))) & 0xffffffff:x}.vrt"
-    opts = gdal.WarpOptions(
-        format="VRT",
-        dstSRS=dst_srs,
-        outputBounds=(xmin, ymin, xmax, ymax),
-        xRes=xres, yRes=yres,
-        targetAlignedPixels=tap,
-        resampleAlg="bilinear",
-        cutlineWKT=geom_dst.wkt, cutlineSRS=dst_srs, cropToCutline=True,
-        dstNodata=-9999.0,
-        outputType=gdal.GDT_Float32,
-        warpOptions={"NUM_THREADS":"ALL_CPUS","INIT_DEST":"NO_DATA","UNIFIED_SRC_NODATA":"YES"},
-        srcBands=[band_index],
-    )
-    gdal.Warp(vrt_path, src_path, options=opts)
-    return vrt_path
+# def add_pixelfunc_to_vrt(vrt_path: Path, func_name: str) -> None:
+#     """
+#     Add a PixelFunctionType to a VRT file. The function should be defined in GDAL.
+#     Modifies the VRT file in place.
+#     """
+#     # read the VRT XML
+#     tree = etree.parse(str(vrt_path))
+#     root = tree.getroot()
+#     band1 = root.findall(".//VRTRasterBand[@band='1']")[0]
 
+#     # add PixelFunctionType element
+#     band1.set("subClass","VRTDerivedRasterBand")
+#     pixelFunctionType = etree.SubElement(band1, 'PixelFunctionType')
+#     pixelFunctionType.text = func_name
+#     pixelFunctionLanguage = etree.SubElement(band1, 'PixelFunctionLanguage')
+#     pixelFunctionLanguage.text = "Python"
+#     pixelFunctionCode = etree.SubElement(band1, 'PixelFunctionCode')
+#     # function that finds median of dB data
+#     pixelFunctionCode.text = etree.CDATA("""
+# import numpy as np
+# def {func_name}(in_ar, out_ar, xoff, yoff, xsize, ysize, raster_xsize, raster_ysize, buf_radius, gt, **kwargs):
+#     data = in_ar[0]
+#     data = np.where(data > 0, data, np.nan)
+#     # compute median along the stack axis (0)
+#     median = np.nanmedian(data, axis=0)
+#     # convert back to UInt16 dB
+#     median_db = np.where(np.isnan(median), 0, np.clip(np.round(10 * np.log10(median)), 0, 65535)).astype(np.uint16)
+#     out_ar[:] = median_db
+# """.format(func_name=func_name))
 
-def write_median_uint16_from_vrts(
-    vrt_paths: List[str], out_path: Path, db_min: float, db_max: float, block: int = 512
-):
-    """NaN-median stack → UInt16 dB (0=NoData), writes Scale/Offset, ZSTD+PREDICTOR=2."""
-    if not vrt_paths:
-        return
-    ds0 = gdal.Open(vrt_paths[0])
-    nx, ny = ds0.RasterXSize, ds0.RasterYSize
-    gt, prj = ds0.GetGeoTransform(), ds0.GetProjection()
-    ds0 = None
+#     # write back the modified VRT
+#     tree.write(str(vrt_path), pretty_print=True, xml_declaration=True, encoding="UTF-8")
 
-    co = ["TILED=YES","COMPRESS=ZSTD","ZSTD_LEVEL=15","PREDICTOR=2","BIGTIFF=YES","BLOCKXSIZE=512","BLOCKYSIZE=512"]
-    drv = gdal.GetDriverByName("GTiff")
-    dst = drv.Create(str(out_path), nx, ny, 1, gdal.GDT_UInt16, options=co)
-    dst.SetGeoTransform(gt); dst.SetProjection(prj)
-    b = dst.GetRasterBand(1); b.SetNoDataValue(0)
-
-    scale = (db_max - db_min) / (65534 - 1)
-    offset = db_min - scale * 1
-    b.SetScale(scale); b.SetOffset(offset)
-
-    for y0 in range(0, ny, block):
-        ysize = min(block, ny - y0)
-        for x0 in range(0, nx, block):
-            xsize = min(block, nx - x0)
-            stack = []
-            for p in vrt_paths:
-                d = gdal.Open(p)
-                a = d.GetRasterBand(1).ReadAsArray(x0, y0, xsize, ysize).astype(np.float32)
-                a[a <= -9998.5] = np.nan
-                stack.append(a)
-                d = None
-            cube = np.stack(stack, axis=0)
-            med = np.nanmedian(cube, axis=0).astype(np.float32)
-
-            dn = np.round((med - db_min) * (65533.0 / (db_max - db_min)) + 1.0)
-            dn = np.clip(dn, 1.0, 65534.0).astype(np.uint16)
-            dn[np.isnan(med)] = 0
-            b.WriteArray(dn, xoff=x0, yoff=y0)
-
-    b.FlushCache(); dst.FlushCache(); dst = None
-    for p in vrt_paths:
-        gdal.Unlink(p)

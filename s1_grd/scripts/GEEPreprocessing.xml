@@ -96,14 +96,26 @@
       <externalAuxFile/>
     </parameters>
   </node>
-  <node id="Convert-Datatype">
-    <operator>Convert-Datatype</operator>
-    <sources>
-      <sourceProduct refid="Terrain-Correction"/>
-    </sources>
+  <node id="To-dB">
+    <operator>BandMaths</operator>
+    <sources><sourceProduct refid="Terrain-Correction"/></sources>
     <parameters class="com.bc.ceres.binding.dom.XppDomElement">
-      <targetDataType>uint16</targetDataType>
-      <targetNoDataValue>65535</targetNoDataValue>
+      <targetBands>
+        <targetBand>
+          <name>Sigma0_VV_db</name>
+          <type>float32</type>
+          <expression>(Sigma0_VV &lt;= 0) ? NaN : 10*log10(Sigma0_VV)</expression>
+          <noDataValue>NaN</noDataValue>
+          <noDataValueUsed>true</noDataValueUsed>
+        </targetBand>
+        <targetBand>
+          <name>Sigma0_VH_db</name>
+          <type>float32</type>
+          <expression>(Sigma0_VH &lt;= 0) ? NaN : 10*log10(Sigma0_VH)</expression>
+          <noDataValue>NaN</noDataValue>
+          <noDataValueUsed>true</noDataValueUsed>
+        </targetBand>
+      </targetBands>
     </parameters>
   </node>
   <applicationData id="Presentation">
@@ -126,8 +138,8 @@
     <node id="Terrain-Correction">
       <displayPosition x="719.0" y="135.0"/>
     </node>
-    <node id="Convert-Datatype">
-      <displayPosition x="830.0" y="135.0"/>
+    <node id="To-dB">
+      <displayPosition x="800.0" y="135.0"/>
     </node>
     <node id="Write">
       <displayPosition x="940.0" y="135.0"/>
