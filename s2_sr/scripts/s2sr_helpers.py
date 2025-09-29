@@ -47,38 +47,61 @@ AUTH_URL  = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/
 # SMALL UTILITIES
 # ---------------------------------------------------------------------
 
-def setup_rank_logging(log_dir: Path, rank: int, level=logging.INFO) -> logging.Logger:
+def setup_rank_logger(
+    log_dir: Path,
+    rank: int,
+    size: int,
+    name: str = "s1_pipeline",
+    level: int | None = None,
+    overwrite: bool = False,  # True: 'w' (fresh file); False: 'a' (append)
+    per_run_suffix: bool = True,  # True: add datetime to filename for this run
+) -> logging.Logger:
+    """
+    Per-rank logger that writes to logs/<name>_rank{rank}[_{YYYYmmdd-HHMMSS}].log
+    and also mirrors to console. No rotation — delete whenever you want.
+    """
+    rank = rank + 1
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    logging.addLevelName(logging.CRITICAL, "FATAL")
-    logging.addLevelName(logging.WARNING,  "WARN")
+    if level is None:
+        level_name = os.environ.get("S1_LOG_LEVEL", "INFO").upper()
+        level = getattr(logging, level_name, logging.INFO)
 
-    logger = logging.getLogger("s2_pipeline")
+    # filename (optionally include run timestamp)
+    suffix = f"_{datetime.now().strftime('%Y%m%d')}" if per_run_suffix else ""
+    logfile = log_dir / f"{name}_rank{rank}{suffix}.log"
+
+    logger_name = f"{name}.rank{rank}"
+    logger = logging.getLogger(logger_name)
     logger.setLevel(level)
-    logger.propagate = False
-    logger.handlers.clear()
+    logger.handlers.clear()  # avoid duplicates if re-initialized
 
-    class _LowercaseFilter(logging.Filter):
-        def filter(self, record):
-            record.levelname_lower = record.levelname.lower()
-            record.rank = rank
-            return True
-
-    filt = _LowercaseFilter()
     fmt = logging.Formatter(
-        "%(asctime)s [rank %(rank)d] [%(levelname_lower)s] %(message)s",
+        fmt="%(asctime)s [rank %(rank)s/%(size)s] %(levelname)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-    fh = logging.FileHandler(log_dir / f"pipeline_rank{rank}.log", mode="a", encoding="utf-8")
-    fh.setFormatter(fmt); fh.addFilter(filt)
+    class _RankFilter(logging.Filter):
+        def filter(self, record):
+            record.rank = rank
+            record.size = size
+            return True
+
+    # File handler
+    fh = logging.FileHandler(logfile, mode=("w" if overwrite else "a"), encoding="utf-8")
+    fh.setFormatter(fmt); fh.addFilter(_RankFilter()); fh.setLevel(level)
     logger.addHandler(fh)
 
-    if rank == 0:
-        ch = logging.StreamHandler()
-        ch.setFormatter(fmt); ch.addFilter(filt)
-        logger.addHandler(ch)
+    # Console handler
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt); ch.addFilter(_RankFilter()); ch.setLevel(level)
+    logger.addHandler(ch)
 
+    # Tame noisy libs if desired
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+    # make the path easy to see at start
+    logger.info("Logging to %s", logfile)
     return logger
 
 
@@ -98,6 +121,11 @@ def gdalinfo_json(p: Path) -> dict:
     out = subprocess.run(["gdalinfo", "-json", str(p)],
                          check=True, capture_output=True, text=True)
     return json.loads(out.stdout)
+
+
+def res_from_band_filename(name_or_path: str) -> str | None:
+    m = re.search(r'_(\d{2})m\.jp2$', str(name_or_path))
+    return m.group(1) if m else None
 
 
 # ---------------------------------------------------------------------
@@ -324,10 +352,12 @@ def extract_tile_from_name(product_name: str) -> str | None:
 
 
 def select_targets(session: requests.Session, product_id, product_name: str,
-                   bands: Iterable[str], bands_res: str) -> tuple[list[tuple], str, str | None]:
+                   bands: Iterable[str], bands_res: str | list[str]) -> tuple[list[tuple], str, str | None, dict]:
     """
-    Build the list of file-node paths (as tuples of node segments) to download.
+    Build file-node paths per band with per-band resolution fallback.
+    Returns (targets, root, granule_dir, band_res_map) where band_res_map is { 'B08': '10', ... }.
     """
+    res_list = [str(int(float(bands_res)))] if isinstance(bands_res, (str, int, float)) else [str(int(r)) for r in bands_res]
     root = find_safe_root_node(session, product_id)
 
     granule_dir = None
@@ -342,23 +372,38 @@ def select_targets(session: requests.Session, product_id, product_name: str,
         granule_dir = granules[0]["Name"]
 
     targets: list[tuple] = []
+    band_res_map: dict[str, str] = {}
+
     if granule_dir:
-        try:
-            res = list_children(session, product_id, root, "GRANULE", granule_dir, "IMG_DATA", f"R{bands_res}m")
-            for node in res:
-                fname = node.get("Name", "")
-                for b in bands:
-                    if fname.endswith(f"_{b}_{bands_res}m.jp2"):
-                        targets.append((root, "GRANULE", granule_dir, "IMG_DATA", f"R{bands_res}m", fname))
-                        break
-        except requests.HTTPError:
-            pass
-        # tile-level XML
+        # Pre-list nodes by resolution directory to avoid repeated API calls
+        nodes_by_res: dict[str, list[dict]] = {}
+        for res_try in res_list:
+            try:
+                nodes_by_res[res_try] = list_children(session, product_id, root, "GRANULE", granule_dir, "IMG_DATA", f"R{res_try}m")
+            except requests.HTTPError:
+                nodes_by_res[res_try] = []
+
+        # For each band, pick the first resolution that has a hit
+        for b in bands:
+            picked = False
+            for res_try in res_list:
+                hit = next((n for n in nodes_by_res[res_try] if n.get("Name","").endswith(f"_{b}_{res_try}m.jp2")), None)
+                if hit:
+                    targets.append((root, "GRANULE", granule_dir, "IMG_DATA", f"R{res_try}m", hit["Name"]))
+                    band_res_map[b] = res_try
+                    picked = True
+                    break
+            if not picked:
+                # no file for this band at any requested resolution
+                band_res_map[b] = None
+
+        # Always include tile-level XML if granule exists
         targets.append((root, "GRANULE", granule_dir, "MTD_TL.xml"))
 
     # product-level XML
     targets.append((root, "MTD_MSIL2A.xml"))
-    return targets, root, granule_dir
+
+    return targets, root, granule_dir, band_res_map
 
 
 def relpath_for_segments(segments: Sequence[str], include_safe_root: bool = True,
@@ -643,11 +688,25 @@ def append_scene_rows_bulk(csv_path: Path, rows: list[dict]) -> int:
     return wrote
 
 
-def backfill_index_from_existing_xmls(output_root: str | Path, bands_res: str, csv_path: Path) -> int:
+def _first_res_str(bands_res: str | int | float | list[str | int | float]) -> str:
+    """
+    Return the first resolution as a clean string like '20' or '10'.
+    Accepts scalars ('20', 20) or lists (['20','10']).
+    """
+    if isinstance(bands_res, (str, int, float)):
+        return str(int(float(bands_res)))
+    # assume list/tuple
+    if not bands_res:
+        raise ValueError("bands_res list is empty")
+    return str(int(float(bands_res[0])))
+
+
+def backfill_index_from_existing_xmls(output_root: str | Path, bands_res: str | list[str], csv_path: Path) -> int:
+    res_str = _first_res_str(bands_res)  # <— NEW
     rows = []
     for xml in Path(output_root).glob("**/GRANULE/*/MTD_T*.xml"):
         try:
-            geo = parse_tile_xml(str(xml), resolution=bands_res)
+            geo = parse_tile_xml(str(xml), resolution=res_str)  # <— pass a scalar
         except Exception as e:
             print("BACKFILL parse error:", xml, e); continue
         safe = next((p for p in xml.parents if p.name.endswith(".SAFE")), None)
@@ -685,14 +744,10 @@ def _guess_local_granule_dir(safe_dir: Path, product_name: str) -> Path | None:
 
 
 def fast_local_complete_safe(output_root: Path, product_name: str,
-                             bands_res: str,
+                             bands_res: str | list[str],
                              bands: Iterable[str] | None = None,
                              require_xml: bool = True) -> tuple[bool, dict]:
-    """
-    Returns (is_complete, detail_dict). Does **no network I/O**.
-    Complete means: for the chosen GRANULE, all requested bands (plus SCL)
-    exist under IMG_DATA/R{bands_res}m, and (optionally) MTD_TL.xml + MTD_MSIL2A.xml exist.
-    """
+    res_list = [str(int(float(bands_res)))] if isinstance(bands_res, (str, int, float)) else [str(int(r)) for r in bands_res]
     safe_dir = output_root / (product_name if product_name.endswith(".SAFE") else f"{product_name}.SAFE")
     if not safe_dir.exists():
         return False, {"reason": "safe_dir_missing", "safe_dir": str(safe_dir)}
@@ -701,35 +756,50 @@ def fast_local_complete_safe(output_root: Path, product_name: str,
     if gran is None:
         return False, {"reason": "granule_missing", "safe_dir": str(safe_dir)}
 
-    res_dir = gran / "IMG_DATA" / f"R{bands_res}m"
-    if not res_dir.exists():
-        return False, {"reason": f"r{bands_res}m_missing", f"r{bands_res}": str(res_dir)}
-
     missing = []
-    present = 0
-    for b in bands:
-        pat = str(res_dir / f"*_{b}_{bands_res}m.jp2")
-        matches = glob(pat)
-        if matches:
-            present += 1
-        else:
+    band_res_map: dict[str, str | None] = {}
+    for b in (bands or []):
+        found = False
+        for res_try in res_list:
+            res_dir = gran / "IMG_DATA" / f"R{res_try}m"
+            if res_dir.exists():
+                pat = str(res_dir / f"*_{b}_{res_try}m.jp2")
+                if glob(pat):
+                    band_res_map[b] = res_try
+                    found = True
+                    break
+        if not found:
+            band_res_map[b] = None
             missing.append(b)
 
     if require_xml:
-        tile_xml = gran / "MTD_TL.xml"
-        prod_xml = safe_dir / "MTD_MSIL2A.xml"
-        xml_ok = tile_xml.exists() and prod_xml.exists()
+        xml_ok = (gran / "MTD_TL.xml").exists() and (safe_dir / "MTD_MSIL2A.xml").exists()
     else:
         xml_ok = True
 
     ok = (not missing) and xml_ok
     return ok, {
-        "present_bands": int(present),
         "missing_bands": missing,
         "xml_ok": xml_ok,
         "granule_dir": str(gran),
         "safe_dir": str(safe_dir),
+        "band_res_map": band_res_map,
     }
+
+
+def _normalize_res_list(bands_res: str | int | float | list[str | int | float]) -> list[str]:
+    return ([str(int(float(bands_res)))]
+            if isinstance(bands_res, (str, int, float))
+            else [str(int(float(r))) for r in bands_res])
+
+
+def _pick_actual_res(res_pref: list[str], band_res_map: dict[str, str | None]) -> str:
+    avail = {r for r in band_res_map.values() if r}
+    for r in res_pref:
+        if r in avail:
+            return r
+    # fallback: first available, else first preference
+    return next(iter(avail), res_pref[0])
 
 
 def download_selected_files_from_cdse_row(
@@ -737,7 +807,7 @@ def download_selected_files_from_cdse_row(
     session: requests.Session,
     output_dir: str | Path,
     bands: Iterable[str],
-    bands_res: str,
+    bands_res: str | list[str],
     scene_csv: str | Path,
     id_col: str = "Id",
     name_col: str = "Name",
@@ -745,17 +815,21 @@ def download_selected_files_from_cdse_row(
     product_id = row[id_col]
     product_name = row[name_col]
 
-    # ---- FAST LOCAL CHECK (no network) ----
+    res_pref = _normalize_res_list(bands_res)
+
+    # ---- FAST LOCAL CHECK (multi-res aware) ----
     ok, detail = fast_local_complete_safe(Path(output_dir), product_name, bands_res, bands)
     if ok:
-        # we still try to index (scene_xml parse) later if needed, but skip any node listing
-        print(f"SKIP: complete for {product_name} (all bands + XML present)")
+        # pick a reasonable resolution for indexing (prefer first requested that exists)
+        band_res_map = detail.get("band_res_map", {}) or {}
+        actual_res = _pick_actual_res(res_pref, band_res_map)
+        print(f"SKIP: complete for {product_name} (bands + XML present @ {actual_res} m)")
         # attempt index append from existing tile XML
         gran_dir = Path(detail["granule_dir"])
         tile_xml_path = gran_dir / "MTD_TL.xml"
         if tile_xml_path.exists():
             try:
-                geo = parse_tile_xml(str(tile_xml_path), resolution=bands_res)
+                geo = parse_tile_xml(str(tile_xml_path), resolution=actual_res)
                 append_scene_row(scene_csv, dict(
                     scene_id=gran_dir.name, product_name=product_name,
                     epsg=geo["epsg"], xmin=geo["xmin"], ymin=geo["ymin"], xmax=geo["xmax"], ymax=geo["ymax"],
@@ -766,11 +840,14 @@ def download_selected_files_from_cdse_row(
                 print(f"INDEX ERROR parsing {tile_xml_path}: {e}")
         return "ok"
 
-    # ---- Otherwise fall back to API node listing (slower path) ----
-    targets, root, granule_dir = select_targets(session, product_id, product_name, bands, bands_res)
+    # ---- API node listing with per-band resolution fallback ----
+    targets, root, granule_dir, band_res_map = select_targets(session, product_id, product_name, bands, bands_res)
     if not targets:
         print(f"NO TARGETS for {product_name}")
         return "error: no targets found"
+
+    # choose resolution for geocoding/indexing
+    actual_res = _pick_actual_res(res_pref, band_res_map)
 
     INCLUDE_SAFE = True
     PB_TAG = None
@@ -782,16 +859,16 @@ def download_selected_files_from_cdse_row(
         (present if os.path.exists(full) else missing).append(segs)
 
     if not missing:
-        print(f"SKIP: complete for {product_name} (all {len(targets)} files present)")
+        print(f"SKIP: complete for {product_name} ({len(targets)} files present @ {actual_res} m)")
     else:
-        print(f"{product_name}: {len(present)} present, {len(missing)} missing → downloading missing only")
+        print(f"{product_name}: {len(present)} present, {len(missing)} missing -> downloading missing only")
         for segs in missing:
             status = download_node(session, product_id, segs, output_dir,
                                    include_safe_root=INCLUDE_SAFE, pb_tag=PB_TAG)
             if status != "ok":
                 print("  ", segs, "->", status)
 
-    # Indexing via tile XML (works whether we downloaded or already had it)
+    # Indexing via tile XML
     tile_xml_rel = None
     for segs in targets:
         if isinstance(segs, tuple) and len(segs) >= 4 and segs[-1] == "MTD_TL.xml":
@@ -809,7 +886,7 @@ def download_selected_files_from_cdse_row(
 
     scene_id = granule_dir or product_name
     try:
-        geo = parse_tile_xml(tile_xml_path, resolution=bands_res)
+        geo = parse_tile_xml(tile_xml_path, resolution=actual_res)
         append_scene_row(scene_csv, dict(
             scene_id=scene_id, product_name=product_name,
             epsg=geo["epsg"], xmin=geo["xmin"], ymin=geo["ymin"], xmax=geo["xmax"], ymax=geo["ymax"],
@@ -825,8 +902,6 @@ def download_selected_files_from_cdse_row(
 # ---------------------------------------------------------------------
 # MASK AND OFFSET VRT BUILDER
 # ---------------------------------------------------------------------
-
-DST_NODATA_DEFAULT = 65535
 
 def parse_pb_from_path(p: Path) -> float | None:
     m = re.search(r"_N(\d{4})_", str(p))
@@ -927,6 +1002,7 @@ def mask_and_offset(in_ar, out_ar, *args, **kwargs):
       <SourceBand>1</SourceBand>
       <SrcRect xOff="0" yOff="0" xSize="{w}" ySize="{h}"/>
       <DstRect xOff="0" yOff="0" xSize="{w}" ySize="{h}"/>
+      <NODATA>0</NODATA> 
     </SimpleSource>
 
   </VRTRasterBand>
@@ -942,7 +1018,7 @@ def warp_to_wgs84_vrt(
     src_vrt: Path,
     out_vrt: Path,
     *,
-    dst_nodata: int = DST_NODATA_DEFAULT,
+    dst_nodata: int = 65535,
     target_srs: str = "EPSG:4326",
     tr: tuple[float,float] | None = None,
     te: tuple[float,float,float,float] | None = None,
@@ -1086,6 +1162,7 @@ def build_median_vrt_from_stack(stack_vrt: Path,
         <SourceBand>{i}</SourceBand>
         <SrcRect xOff="0" yOff="0" xSize="{w}" ySize="{h}"/>
         <DstRect xOff="0" yOff="0" xSize="{w}" ySize="{h}"/>
+        <NODATA>{nodata_in}</NODATA>
         </SimpleSource>"""
         for i in range(1, n_bands + 1)
     )
@@ -1101,29 +1178,24 @@ def build_median_vrt_from_stack(stack_vrt: Path,
     <PixelFunctionArguments nodata_in="{nodata_in}" nodata_out="{nodata_out}"/>
     <PixelFunctionCode><![CDATA[
 import numpy as np
-def _to_float(x, default):
-    if x is None: return default
-    if isinstance(x, bytes): x = x.decode('utf-8','ignore')
-    s = str(x).strip().strip('"').strip("'")
-    try: return float(s)
-    except: return default
-
 def masked_median(in_ar, out_ar, *args, **kwargs):
-    # in_ar is a tuple of 2D arrays (one per SimpleSource band)
-    nd_in  = _to_float(kwargs.get("nodata_in"),  65535.0)
-    nd_out = _to_float(kwargs.get("nodata_out"), -9999.0)
+    # read args (strings in VRT) with sane defaults
+    nd_in = float(kwargs.get("nodata_in", 65535))
+    nd_out = float(kwargs.get("nodata_out", -9999))
 
-    # Stack to (N, y, x) and work in float32
-    arr = np.asarray(in_ar, dtype=np.float32)
+    # (1) explicit stack -> float32 so NaN is representable
+    arr = np.stack(in_ar).astype(np.float32, copy=False)  # shape (N, Y, X)
 
-    # Treat input nodata as NaN
+    # (2) turn input nodata into NaN
     arr[arr == nd_in] = np.nan
 
-    # Median across the stack, ignoring NaNs
+    # median across bands, ignoring NaNs
     med = np.nanmedian(arr, axis=0)
 
-    # Fill all-NaN pixels with output nodata and write
+    # fill all-NaN pixels with output nodata
     np.nan_to_num(med, copy=False, nan=nd_out)
+
+    # write result
     out_ar[:] = med.astype(np.float32, copy=False)
 ]]></PixelFunctionCode>
 {sources_xml}
@@ -1142,7 +1214,7 @@ def warp_cutline_wkt_py(
     cutline_wkt: str,
     *,
     dst_nodata: float = -9999.0,
-    resample: str = "near",  # e.g., "near","bilinear","cubic","cubicspline","lanczos","average","mode","max","min","med","q1","q3"
+    resample: str = "near",
     num_threads: int = 1,
     creation_opts: Sequence[str] = ("TILED=YES","COMPRESS=ZSTD","PREDICTOR=2","BIGTIFF=YES"),
 ) -> Path:
@@ -1223,15 +1295,33 @@ def find_band_jp2s_by_res(output_root: Path, safe_names: Iterable[str],
 
 
 def corresponding_scl_for_band(band_jp2: Path, band_res: str) -> Path:
+    """
+    Return the most appropriate SCL path for a given band image:
+      1) Try SCL at the same resolution (same R{res}m dir).
+      2) Fall back to SCL_20m in the R20m dir (standard for L2A).
+      3) As a last resort, look for any SCL_*m under IMG_DATA (preferring 20m).
+    Returns a Path (may not exist—caller should still .exists()).
+    """
     name = band_jp2.name
-    # Try same res first
     pat = r'_(?:B\d{2}|B8A)_(?:10|20|60)m\.jp2$'
-    same = band_jp2.with_name(re.sub(pat, f'_SCL_{band_res}m.jp2', name))
-    if same.exists():
-        return same
-    # Fallback: most L2A deliveries include SCL at 20 m
-    fallback = band_jp2.with_name(re.sub(pat, '_SCL_20m.jp2', name))
-    return fallback
+
+    # directories
+    # .../GRANULE/<gran>/IMG_DATA/R{res}m/<file>
+    r_dir = band_jp2.parent  # R{res}m
+    img_data = r_dir.parent  # IMG_DATA
+    r20_dir = img_data / "R20m"
+
+    # same-res SCL in the same directory
+    same_name = re.sub(pat, f'_SCL_{band_res}m.jp2', name)
+    same_path = r_dir / same_name
+    if same_path.exists():
+        return same_path
+
+    # fallback to 20m SCL in R20m directory
+    fb20_name = re.sub(pat, '_SCL_20m.jp2', name)
+    fb20_path = r20_dir / fb20_name
+    if fb20_path.exists():
+        return fb20_path
 
 
 # ---------------------------------------------------------------------

@@ -85,7 +85,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         required=True,
         nargs="+",
         type=str,
-        default=["B02","B03","B04","B05","B06","B07","B8A","B11","B12"],
+        default=["B02","B03","B04","B05","B06","B07","B08","B8A","B11","B12"],
         help="Band list (SCL is auto-included); e.g., --bands B02 B03 B04 B05 B06 B07 B8A B11 B12"
     )
     p.add_argument(
@@ -150,7 +150,7 @@ def main():
     TMP_DIR = BASE_PATH / "tmp"; TMP_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR = BASE_PATH / "logs"
 
-    logger = hf.setup_rank_logging(LOG_DIR, rank)
+    logger = hf.setup_rank_logger(LOG_DIR, rank, size, overwrite=True)
 
     # Per-rank scratch (keeps GDAL temp local & contention-free)
     rank_tmp = TMP_DIR / f"rank_{rank}"; rank_tmp.mkdir(parents=True, exist_ok=True)
@@ -250,9 +250,10 @@ def main():
     # I.i. [Rank 0] Download
     # ---------------------------------------------------------------------
     target_res = str(args.bands_res)
+    bands_res = ["20", "10"] if target_res == "20" else ["20", "60"] if target_res == "60" else [target_res]
     if rank == 0:
         backfilled = hf.backfill_index_from_existing_xmls(
-            output_root=OUT_DIR, bands_res=target_res, csv_path=SCENE_INDEX_CSV)
+            output_root=OUT_DIR, bands_res=bands_res, csv_path=SCENE_INDEX_CSV)
         if backfilled:
             logger.info(f"backfilled {backfilled} scenes into index.")
 
@@ -263,8 +264,10 @@ def main():
 
         logger.info(f"downloading {len(dl_df)} .SAFE products (missing only) to {OUT_DIR} with max 2 concurrent workers")
         failures = hf.download_rows_concurrent(
-            dl_df, OUT_DIR, bands=set(args.bands) | {"SCL"},
-            bands_res=str(args.bands_res),
+            dl_df, 
+            OUT_DIR, 
+            bands=set(args.bands) | {"SCL"},
+            bands_res=bands_res,
             scene_csv=SCENE_INDEX_CSV,
             max_workers=2,
             logger=logger,
@@ -304,8 +307,16 @@ def main():
     jp2s = []
     missing = []
     for b in req_bands:
-        hits = hf.find_band_jp2s_by_res(OUT_DIR, product_names, b, target_res)
-        (jp2s.extend(hits) if hits else missing.append(b))
+        res_pref = ["20","10"] if target_res == "20" else [target_res]
+        hits = []
+        for r in res_pref:
+            hits = hf.find_band_jp2s_by_res(OUT_DIR, product_names, b, r)
+            if hits:
+                break
+        if hits:
+            jp2s.extend(hits)
+        else:
+            missing.append(b)
 
     if rank == 0:
         if missing:
@@ -334,7 +345,8 @@ def main():
 
     for band_jp2 in my_jobs:
         try:
-            scl_jp2 = hf.corresponding_scl_for_band(band_jp2, target_res)
+            band_res_for_this = hf.res_from_band_filename(band_jp2.name) or target_res
+            scl_jp2 = hf.corresponding_scl_for_band(band_jp2, band_res_for_this)
             if not scl_jp2.exists():
                 logger.warning(f"[phase1][rank {rank}] missing SCL for {band_jp2}")
                 continue
@@ -504,6 +516,7 @@ def main():
             out_dir = comp_dir / str(cell_id)
             out_dir.mkdir(parents=True, exist_ok=True)
             out_tif = out_dir / f"{stem}_median_clip.tif"
+            logging.info(f"[phase2][rank {rank}] cell {cell_id} band {band_code} -> {out_tif.name}")
             hf.warp_cutline_wkt_py(median_vrt, out_tif, cutline_wkt=geom.wkt)
 
         except Exception as e:
