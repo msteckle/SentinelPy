@@ -38,6 +38,5 @@ mpirun -x EARTHDATA_USER -x EARTHDATA_PASS -n 10 python s1grd_pipeline.py \
   --snap-userdir $SNAP_USER_DIR \
   --snap-outdir /mnt/poseidon/remotesensing/arctic/data/rasters/esa_sentinel/s1_grd/snap_outputs \
   --snap-prefix Orb_NR_Cal_TC \
-  --snap-overwrite \
   --tr 0.000179663056824 0.000179663056824 \
   --tap \

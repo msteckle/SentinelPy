@@ -484,12 +484,9 @@ def build_scene_index(all_proc: List[str]) -> Tuple[str, gpd.GeoDataFrame]:
 # import numpy as np
 # def {func_name}(in_ar, out_ar, xoff, yoff, xsize, ysize, raster_xsize, raster_ysize, buf_radius, gt, **kwargs):
 #     data = in_ar[0]
-#     data = np.where(data > 0, data, np.nan)
-#     # compute median along the stack axis (0)
-#     median = np.nanmedian(data, axis=0)
-#     # convert back to UInt16 dB
-#     median_db = np.where(np.isnan(median), 0, np.clip(np.round(10 * np.log10(median)), 0, 65535)).astype(np.uint16)
-#     out_ar[:] = median_db
+#     # 1) ensure nodata is NaN
+#     # 2) compute median along the stack axis (0)
+#     # 3) return as is
 # """.format(func_name=func_name))
 
 #     # write back the modified VRT

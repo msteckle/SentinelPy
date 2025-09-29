@@ -225,68 +225,75 @@ def main():
     # III. Extract scenes intersecting each grid cell
     # -----------------------------------------------------------------
 
-    # all_proc = processed # all processed products
-    # if is_rank0:
+    all_proc = processed # all processed products
+    if is_rank0:
 
-    #     # subselect gridcells from the panarctic grid that intersect the AOI
-    #     logger.info("loading grid CSV...")
-    #     grid = pd.read_csv(args.grid_csv, dtype={"tile_id_rc": str} if "tile_id_rc" in pd.read_csv(args.grid_csv, nrows=0).columns else None)
-    #     if not {"xmin","ymin","xmax","ymax"}.issubset(grid.columns):
-    #         logger.critical("grid CSV must contain xmin,ymin,xmax,ymax columns.")
-    #         sys.exit(4)
-    #     grid["geometry"] = grid.apply(lambda r: box(r.xmin, r.ymin, r.xmax, r.ymax), axis=1)
-    #     grid = gpd.GeoDataFrame(grid, geometry="geometry", crs="EPSG:4326")
-    #     aoi_gdf = gpd.GeoDataFrame(geometry=[aoi_poly], crs="EPSG:4326")
-    #     grid = gpd.overlay(grid, aoi_gdf, how="intersection")
-    #     if grid.empty:
-    #         logger.critical("no grid cells intersect the AOI.")
-    #         sys.exit(5)
-    #     logger.info(f"{len(grid)} grid cells intersect the AOI.")
+        # create a GeoDataFrame of the panarctic grid
+        logger.info("loading grid CSV...")
+        arctic_grid = pd.read_csv(args.grid_csv, dtype={"tile_id_rc": str} if "tile_id_rc" in pd.read_csv(args.grid_csv, nrows=0).columns else None)
+        if not {"xmin","ymin","xmax","ymax"}.issubset(arctic_grid.columns):
+            logger.critical("grid CSV must contain xmin,ymin,xmax,ymax columns.")
+            sys.exit(4)
+        arctic_grid["geometry"] = arctic_grid.apply(lambda r: box(r.xmin, r.ymin, r.xmax, r.ymax), axis=1)
+        arctic_grid = gpd.GeoDataFrame(arctic_grid, geometry="geometry", crs="EPSG:4326")
 
-    #     # build an index of processed products with their footprints
-    #     logger.info("building scene index...")
-    #     scenes = []
-    #     for p in all_proc:
+        # create a GeoDataFrame of the AOI
+        aoi_gdf = gpd.GeoDataFrame(geometry=[aoi_poly], crs="EPSG:4326")
 
-    #         # read gdal.Info JSON
-    #         info = gdal.Info(p, format="json")
-    #         if "cornerCoordinates" not in info:
-    #             logger.warning(f"no cornerCoordinates in {p}; skipping")
-    #             continue
+        # find panarctic grid cells that intersect the AOI
+        logger.info("finding grid cells that intersect the AOI...")
+        arctic_grid_cells = gpd.overlay(arctic_grid, aoi_gdf, how="intersection")
+        if arctic_grid_cells.empty:
+            logger.critical("no grid cells intersect the AOI.")
+            sys.exit(5)
+        logger.info(f"{len(arctic_grid_cells)} grid cells intersect the AOI.")
+
+        # build an index of processed products with their footprints
+        logger.info("building scene index...")
+        scenes = []
+        for p in all_proc:
+
+            # read gdal.Info JSON
+            info = gdal.Info(p, format="json")
+            if "cornerCoordinates" not in info:
+                logger.warning(f"no cornerCoordinates in {p}; skipping")
+                continue
             
-    #         # build footprint polygon from cornerCoordinates
-    #         cc = info["cornerCoordinates"]
-    #         poly_wkt = shapely_wkt.dumps(box(cc["lowerLeft"][0], cc["lowerLeft"][1], cc["upperRight"][0], cc["upperRight"][1]))
-    #         scenes.append({
-    #             "path": p,
-    #             "xmin": cc["lowerLeft"][0],
-    #             "ymin": cc["lowerLeft"][1],
-    #             "xmax": cc["upperRight"][0],
-    #             "ymax": cc["upperRight"][1],
-    #             "geometry": poly_wkt
-    #         })
+            # build footprint polygon from cornerCoordinates
+            cc = info["cornerCoordinates"]
+            poly_wkt = shapely_wkt.dumps(box(cc["lowerLeft"][0], cc["lowerLeft"][1], cc["upperRight"][0], cc["upperRight"][1]))
+            scenes.append({
+                "path": p,
+                "xmin": cc["lowerLeft"][0],
+                "ymin": cc["lowerLeft"][1],
+                "xmax": cc["upperRight"][0],
+                "ymax": cc["upperRight"][1],
+                "geometry": poly_wkt
+            })
 
-    #     # create a GeoDataFrame of scenes
-    #     scenes = pd.DataFrame(scenes)
-    #     if scenes.empty:
-    #         logger.critical("no valid scenes found after building index.")
-    #         sys.exit(6)
-    #     scenes["geometry"] = scenes["geometry"].apply(shapely_wkt.loads)
-    #     scenes_gdf = gpd.GeoDataFrame(scenes, geometry="geometry", crs="EPSG:4326")
-    #     logger.info(f"{len(scenes_gdf)} scenes in the index.")
+        # create a GeoDataFrame of scenes
+        scenes = pd.DataFrame(scenes)
+        if scenes.empty:
+            logger.critical("no valid scenes found after building index.")
+            sys.exit(6)
+        scenes["geometry"] = scenes["geometry"].apply(shapely_wkt.loads)
+        scenes_gdf = gpd.GeoDataFrame(scenes, geometry="geometry", crs="EPSG:4326")
+        logger.info(f"{len(scenes_gdf)} scenes in the index.")
 
-    #     # Prepare lightweight payloads to broadcast to all ranks
-    #     id_name = "tile_id_rc"
-    #     grid_rows = [(float(r.xmin), float(r.ymin), float(r.xmax), float(r.ymax), r[id_name])
-    #                 for _, r in grid.iterrows()]
-    #     scene_rows = [(row.path, float(row.xmin), float(row.ymin), float(row.xmax), float(row.ymax))
-    #                 for row in scenes_gdf[["path","xmin","ymin","xmax","ymax"]].itertuples(index=False)]
-    #     payload = {"grid_rows": grid_rows, "id_name": id_name, "scene_rows": scene_rows}
+        # get a list of paths to scenes that intersect each grid cell
+        payload = {}
+        for i, cell in enumerate(arctic_grid_cells.itertuples(), 1):
+            intersecting_scenes = gpd.overlay(gpd.GeoDataFrame(geometry=[cell.geometry], crs="EPSG:4326"), scenes_gdf, how="intersection")
+            if intersecting_scenes.empty:
+                logger.warning(f"no scenes intersect grid cell {getattr(cell, 'tile_id_rc', i)}; skipping.")
+                continue
+            payload[cell.tile_id_rc] = intersecting_scenes["path"].tolist()
+        
 
-    # else:
-    #     payload = None
+    else:
+        payload = None
 
-    # comm.Barrier()  # ensure rank 0 is done before others proceed
+    comm.Barrier()  # ensure rank 0 is done before others proceed
 
     # # -----------------------------------------------------------------
     # # IV. Build VRT stacks per cell + polarization
